@@ -1,0 +1,8 @@
+# Operating-system files
+.DS_Store
+Thumbs.db
+
+# Local archives and temporary files
+*.zip
+*.tmp
+*.bak
