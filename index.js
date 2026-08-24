@@ -1862,7 +1862,7 @@ function stmnPanelMarkup() {
         if (stmnPanelOpen) {
             if (!panel.classList.contains('stmn-open')) panel.classList.add('stmn-open');
             if (panel.getAttribute('aria-hidden') !== 'false') panel.setAttribute('aria-hidden', 'false');
-            stmnPresentPanel(panel, stmnIsSideMode());
+            stmnPresentPanel(panel);
             stmnForcePanelVisible(panel, true);
         }
     });
@@ -1873,13 +1873,14 @@ function stmnPanelMarkup() {
     stmnRenderNotes();
 }
 
-function stmnPresentPanel(panel, sideMode) {
-    const desiredMode = sideMode ? 'modeless' : 'modal';
+function stmnPresentPanel(panel) {
+    // Keep the memo window modeless so SillyTavern's chat input remains
+    // focusable and clickable while the memo is open on mobile and tablet.
+    const desiredMode = 'modeless';
     if (panel.open && panel.dataset.dialogMode === desiredMode) return;
     if (panel.open) panel.close();
     try {
-        if (sideMode) panel.show();
-        else panel.showModal();
+        panel.show();
     } catch (error) {
         console.warn('[ChatSSi MeMo] Native dialog presentation failed; using open fallback.', error);
         panel.setAttribute('open', '');
@@ -1911,7 +1912,7 @@ function stmnOpenPanel() {
     document.body.classList.add('stmn-panel-open');
     document.querySelector('#stmn-floating-button')?.setAttribute('aria-expanded', 'true');
     stmnApplyLayout();
-    stmnPresentPanel(panel, stmnIsSideMode());
+    stmnPresentPanel(panel);
     stmnForcePanelVisible(panel, true);
     stmnRenderNotes();
 }
@@ -1988,7 +1989,7 @@ function stmnApplyLayout() {
     stmnPlaceFloating(floating);
     stmnApplyTheme();
     if (stmnPanelOpen) {
-        stmnPresentPanel(panel, stmnIsSideMode(mode));
+        stmnPresentPanel(panel);
         stmnForcePanelVisible(panel, true);
     }
     stmnApplyTabletLandscapeSplit(panel, mode, renderedPanelWidth);
@@ -2417,7 +2418,7 @@ async function stmnInit() {
     });
     setTimeout(stmnAddWandButton, 1200);
     setTimeout(stmnAddSettingsPanel, 1200);
-    console.info('[ChatSSi MeMo] v1.1.0 loaded');
+    console.info('[ChatSSi MeMo] v1.1.1 loaded');
 }
 
 if (document.readyState === 'loading') {
