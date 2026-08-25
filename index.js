@@ -57,8 +57,34 @@ const STMN_BUILTIN_FONTS = Object.freeze([
     { id: 'builtin-school-safety-foundation', label: '학교안심 바른바탕', family: 'SchoolSafetyFoundation', url: 'https://cdn.jsdelivr.net/gh/projectnoonnu/noonfonts_2307-2@1.0/HakgyoansimBareonbatangR.woff2', source: 'font', weight: '400' },
 ]);
 const STMN_HIGHLIGHTS = ['#fff08a', '#ffc5d9', '#bfe7ff', '#cdefbd', '#dccbff'];
+const STMN_TEXT_SIZES = Object.freeze([
+    { id: 'very-large', label: '아주 크게' },
+    { id: 'large', label: '크게' },
+    { id: 'normal', label: '보통' },
+    { id: 'small', label: '작게' },
+    { id: 'very-small', label: '아주 작게' },
+]);
+const STMN_TEXT_SIZE_ALIASES = Object.freeze({
+    '1': 'very-small',
+    'x-small': 'very-small',
+    '9px': 'very-small',
+    '2': 'small',
+    'small': 'small',
+    '11px': 'small',
+    '3': 'normal',
+    'medium': 'normal',
+    '13px': 'normal',
+    '5': 'large',
+    'x-large': 'large',
+    '18px': 'large',
+    '6': 'very-large',
+    'xx-large': 'very-large',
+    '24px': 'very-large',
+});
 const STMN_MAX_IMAGES = 6;
 const STMN_IMAGE_MAX_SIDE = 1280;
+const STMN_TYPING_MARKER = '\u200B';
+const STMN_IME_SETTLE_MS = 120;
 
 let stmnPanelOpen = false;
 let stmnSearch = '';
@@ -72,6 +98,8 @@ let stmnEditorRanges = new Map();
 let stmnSelectedRanges = new Map();
 let stmnPendingImageRanges = new Map();
 let stmnSelectedImages = new Map();
+const stmnComposingEditors = new WeakSet();
+const stmnSettlingEditors = new WeakSet();
 let stmnPanelObserver = null;
 let stmnActiveFontResource = null;
 const stmnNormalizedStores = new WeakSet();
@@ -555,6 +583,85 @@ function stmnCheckLineMarkup(text = '', done = false) {
     return `<div class="stmn-editor-line stmn-check-line${done ? ' is-done' : ''}" data-stmn-line="check" data-checked="${done ? 'true' : 'false'}"><span class="stmn-inline-checkbox" contenteditable="false" role="checkbox" aria-checked="${done ? 'true' : 'false'}" tabindex="-1">${done ? '✓' : ''}</span><span class="stmn-check-content">${text || '<br>'}</span></div>`;
 }
 
+function stmnCreateCheckLineElement(done = false) {
+    const line = document.createElement('div');
+    line.className = `stmn-editor-line stmn-check-line${done ? ' is-done' : ''}`;
+    line.dataset.stmnLine = 'check';
+    line.dataset.checked = String(done);
+    const marker = document.createElement('span');
+    marker.className = 'stmn-inline-checkbox';
+    marker.contentEditable = 'false';
+    marker.setAttribute('role', 'checkbox');
+    marker.setAttribute('aria-checked', String(done));
+    marker.tabIndex = -1;
+    marker.textContent = done ? '✓' : '';
+    const content = document.createElement('span');
+    content.className = 'stmn-check-content';
+    content.append(document.createElement('br'));
+    line.append(marker, content);
+    return line;
+}
+
+function stmnEnsureEditableContent(content) {
+    if (!content) return;
+    const hasText = Boolean((content.textContent || '').replaceAll(STMN_TYPING_MARKER, ''));
+    const hasEmbeddedContent = Boolean(content.querySelector?.('[data-stmn-image], img'));
+    const hasOnlyPlaceholder = content.childNodes.length === 1 && content.firstChild?.nodeName === 'BR';
+    if (!hasText && !hasEmbeddedContent && !hasOnlyPlaceholder) content.replaceChildren(document.createElement('br'));
+}
+
+function stmnEnsureCheckLine(line) {
+    if (!line) return null;
+    line.classList.add('stmn-editor-line', 'stmn-check-line');
+    line.dataset.stmnLine = 'check';
+    const done = line.dataset.checked === 'true';
+    line.dataset.checked = String(done);
+    line.classList.toggle('is-done', done);
+    let marker = line.querySelector(':scope > .stmn-inline-checkbox');
+    let content = line.querySelector(':scope > .stmn-check-content');
+    if (!content) {
+        content = document.createElement('span');
+        content.className = 'stmn-check-content';
+        const movable = [...line.childNodes].filter(child => child !== marker);
+        content.append(...movable);
+        line.append(content);
+    }
+    if (!marker) {
+        marker = document.createElement('span');
+        marker.className = 'stmn-inline-checkbox';
+        line.prepend(marker);
+    }
+    marker.contentEditable = 'false';
+    marker.setAttribute('role', 'checkbox');
+    marker.setAttribute('aria-checked', String(done));
+    marker.tabIndex = -1;
+    const markerText = done ? '✓' : '';
+    if (marker.textContent !== markerText) marker.textContent = markerText;
+    const escapedContent = [...line.childNodes].filter(child => child !== marker && child !== content);
+    if (escapedContent.length) content.append(...escapedContent);
+    if (line.childNodes.length !== 2 || line.firstChild !== marker || line.lastChild !== content) {
+        line.replaceChildren(marker, content);
+    }
+    stmnEnsureEditableContent(content);
+    return content;
+}
+
+function stmnEnsureTextLine(line) {
+    if (!line) return null;
+    const checkContent = line.querySelector?.(':scope > .stmn-check-content');
+    const marker = line.querySelector?.(':scope > .stmn-inline-checkbox');
+    if (checkContent) {
+        checkContent.replaceWith(...checkContent.childNodes);
+    }
+    marker?.remove();
+    line.classList.add('stmn-editor-line');
+    line.classList.remove('stmn-check-line', 'is-done');
+    line.dataset.stmnLine = 'text';
+    delete line.dataset.checked;
+    stmnEnsureEditableContent(line);
+    return line;
+}
+
 function stmnLegacyTextMarkup(html = '') {
     const source = document.createElement('div');
     source.innerHTML = stmnSanitize(html);
@@ -670,8 +777,8 @@ function stmnSanitize(html) {
     const purifier = globalThis.SillyTavern?.libs?.DOMPurify;
     if (!purifier) return String(html ?? '').replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '');
     return purifier.sanitize(String(html ?? ''), {
-        ALLOWED_TAGS: ['div', 'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'span', 'mark'],
-        ALLOWED_ATTR: ['style'],
+        ALLOWED_TAGS: ['div', 'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'span', 'mark', 'font'],
+        ALLOWED_ATTR: ['style', 'size'],
     });
 }
 
@@ -679,8 +786,8 @@ function stmnSanitizeEditorHtml(html) {
     const purifier = globalThis.SillyTavern?.libs?.DOMPurify;
     if (!purifier) return String(html ?? '').replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '');
     return purifier.sanitize(String(html ?? ''), {
-        ALLOWED_TAGS: ['div', 'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'span', 'mark', 'img', 'button'],
-        ALLOWED_ATTR: ['style', 'class', 'data-stmn-line', 'data-checked', 'data-stmn-image', 'data-name', 'data-caption', 'data-remove-image', 'data-placeholder', 'contenteditable', 'tabindex', 'role', 'aria-checked', 'aria-label', 'title', 'src', 'alt', 'draggable', 'type'],
+        ALLOWED_TAGS: ['div', 'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'span', 'mark', 'font', 'img', 'button'],
+        ALLOWED_ATTR: ['style', 'size', 'class', 'data-stmn-line', 'data-stmn-text-size', 'data-checked', 'data-stmn-image', 'data-name', 'data-caption', 'data-remove-image', 'data-placeholder', 'contenteditable', 'tabindex', 'role', 'aria-checked', 'aria-label', 'title', 'src', 'alt', 'draggable', 'type'],
         ALLOW_DATA_ATTR: true,
         ADD_DATA_URI_TAGS: ['img'],
     });
@@ -1003,20 +1110,32 @@ function stmnCardTemplate(note, index, total) {
         <div class="stmn-card-head">
             <input class="stmn-title-input" type="text" maxlength="120" aria-label="메모 제목">
             <div class="stmn-card-actions">
+                <button type="button" class="stmn-tool-button stmn-auto-height-button" data-action="auto-height" title="내용에 맞게 카드 높이 자동 조절">↕ 자동</button>
                 <button type="button" class="stmn-icon-button" data-action="move-up" title="위로" ${index === 0 ? 'disabled' : ''}>▲</button>
                 <button type="button" class="stmn-icon-button" data-action="move-down" title="아래로" ${index === total - 1 ? 'disabled' : ''}>▼</button>
                 <button type="button" class="stmn-icon-button" data-action="collapse" title="접기/펼치기">${note.collapsed ? '＋' : '－'}</button>
                 <button type="button" class="stmn-icon-button is-danger" data-action="delete" title="삭제">×</button>
             </div>
         </div>
-        <div class="stmn-card-tools">
-            <button type="button" class="stmn-tool-button" data-action="toggle-check">☑ 체크</button>
-            <button type="button" class="stmn-tool-button" data-action="add-image">▧ 이미지</button>
-            <button type="button" class="stmn-tool-button" data-action="auto-height" title="내용에 맞게 카드 높이 자동 조절">↕ 자동</button>
+        <div class="stmn-format-row" aria-label="글자 서식">
+            <span>서식</span>
+            <button type="button" class="stmn-tool-button stmn-check-tool-button" data-action="toggle-check" title="체크리스트 전환" aria-label="체크리스트 전환">☑</button>
+            <button type="button" class="stmn-format-button" data-format-command="bold" aria-pressed="false" title="굵게"><strong>B</strong></button>
+            <button type="button" class="stmn-format-button" data-format-command="italic" aria-pressed="false" title="기울이기"><em>I</em></button>
+            <button type="button" class="stmn-format-button" data-format-command="underline" aria-pressed="false" title="밑줄"><u>U</u></button>
+            <button type="button" class="stmn-format-button" data-format-command="strikeThrough" aria-pressed="false" title="취소선"><s>S</s></button>
+            <button type="button" class="stmn-tool-button stmn-image-tool-button" data-action="add-image" title="이미지 삽입" aria-label="이미지 삽입">🖼️</button>
+            <label class="stmn-format-size-label" title="글씨 크기">
+                <span>크기</span>
+                <select class="stmn-format-size" data-format-size aria-label="글씨 크기">
+                    <option value="" selected>글씨 크기</option>
+                    ${STMN_TEXT_SIZES.map(size => `<option value="${size.id}">${size.label}</option>`).join('')}
+                </select>
+            </label>
         </div>
         <div class="stmn-highlight-row" aria-label="형광펜">
             <span>형광펜</span>
-            ${STMN_HIGHLIGHTS.map(color => `<button type="button" class="stmn-highlight" data-highlight="${color}" style="--stmn-highlight:${color}" title="선택한 글자 강조"></button>`).join('')}
+            ${STMN_HIGHLIGHTS.map(color => `<button type="button" class="stmn-highlight" data-highlight="${color}" style="--stmn-highlight:${color}" title="선택한 글자 강조 · 같은 색을 다시 누르면 지우기"></button>`).join('')}
             <button type="button" class="stmn-highlight-clear" data-highlight="transparent" title="형광펜 지우기">지우기</button>
         </div>
         <div class="stmn-card-main"><div class="stmn-unified-editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="메모 내용을 입력하세요"></div></div>
@@ -1067,7 +1186,12 @@ function stmnSetCaretAtTextOffset(element, offset) {
     }
     if (element.matches?.('.stmn-check-content')) {
         if (element.childNodes.length === 1 && element.firstChild?.nodeName === 'BR') {
-            element.replaceChildren();
+            const range = document.createRange();
+            range.setStart(element, 0);
+            range.collapse(true);
+            selection.removeAllRanges();
+            selection.addRange(range);
+            return;
         }
         const textNode = document.createTextNode('');
         element.append(textNode);
@@ -1098,6 +1222,7 @@ function stmnRememberEditorSelection(noteId, editor) {
     if (!editor.contains(range.commonAncestorContainer)) return;
     stmnEditorRanges.set(noteId, range.cloneRange());
     if (!range.collapsed) stmnSelectedRanges.set(noteId, range.cloneRange());
+    else stmnSelectedRanges.delete(noteId);
 }
 
 function stmnUsableRange(noteId, editor, allowSelection = true) {
@@ -1108,8 +1233,132 @@ function stmnUsableRange(noteId, editor, allowSelection = true) {
     return saved && editor.contains(saved.commonAncestorContainer) ? saved : null;
 }
 
+function stmnNormalizeTextSizeMarkup(root) {
+    root?.querySelectorAll?.('font[size], [style*="font-size" i]').forEach(element => {
+        const value = element.getAttribute('size') || element.style.fontSize;
+        const normalized = String(value || '').trim().toLowerCase();
+        const sizeId = STMN_TEXT_SIZE_ALIASES[normalized];
+        if (!sizeId) return;
+        element.dataset.stmnTextSize = sizeId;
+        element.removeAttribute('size');
+        element.style.removeProperty('font-size');
+        if (!element.getAttribute('style')) element.removeAttribute('style');
+    });
+}
+
+function stmnRemoveTypingMarkerCharacters(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+        let index = node.nodeValue.indexOf(STMN_TYPING_MARKER);
+        while (index !== -1) {
+            node.deleteData(index, 1);
+            index = node.nodeValue.indexOf(STMN_TYPING_MARKER);
+        }
+    }
+}
+
+function stmnCleanupTextSizeTypingMarkers(root, removeEmpty = false) {
+    root?.querySelectorAll?.('[data-stmn-typing-size]').forEach(marker => {
+        const realText = (marker.textContent || '').replaceAll(STMN_TYPING_MARKER, '');
+        const hasEmbeddedContent = Boolean(marker.querySelector('img, br, [data-stmn-image]'));
+        if (!realText && !hasEmbeddedContent && !removeEmpty && marker.textContent.includes(STMN_TYPING_MARKER)) return;
+        stmnRemoveTypingMarkerCharacters(marker);
+        marker.removeAttribute('data-stmn-typing-size');
+        if (!marker.textContent && !marker.childElementCount) marker.remove();
+    });
+}
+
+function stmnTextNodeCanReceiveSize(node, editor) {
+    const parent = node?.parentElement;
+    if (!parent || !editor.contains(node)) return false;
+    return !parent.closest('.stmn-inline-checkbox, .stmn-inline-image-frame, .stmn-inline-image-remove');
+}
+
+function stmnTextNodesInRange(range, editor) {
+    const nodes = [];
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            if (!node.nodeValue || !stmnTextNodeCanReceiveSize(node, editor)) return NodeFilter.FILTER_REJECT;
+            try {
+                return range.intersectsNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+            } catch {
+                return NodeFilter.FILTER_REJECT;
+            }
+        },
+    });
+    let node;
+    while ((node = walker.nextNode())) nodes.push(node);
+    return nodes;
+}
+
+function stmnApplyTextSizeToRange(range, editor, sizeId) {
+    if (!range || range.collapsed) return range;
+    const portions = stmnTextNodesInRange(range, editor).map(node => {
+        const start = node === range.startContainer ? range.startOffset : 0;
+        const end = node === range.endContainer ? range.endOffset : node.nodeValue.length;
+        return { node, start, end };
+    }).filter(portion => portion.end > portion.start);
+    const wrappedTextNodes = [];
+    for (const portion of portions.reverse()) {
+        const { node, start, end } = portion;
+        if (end < node.nodeValue.length) node.splitText(end);
+        const selected = start > 0 ? node.splitText(start) : node;
+        const wrapper = document.createElement('span');
+        wrapper.dataset.stmnTextSize = sizeId;
+        selected.replaceWith(wrapper);
+        wrapper.append(selected);
+        wrappedTextNodes.unshift(selected);
+    }
+    if (!wrappedTextNodes.length) return range;
+    const nextRange = document.createRange();
+    nextRange.setStart(wrappedTextNodes[0], 0);
+    const last = wrappedTextNodes.at(-1);
+    nextRange.setEnd(last, last.nodeValue.length);
+    const selection = globalThis.getSelection?.();
+    selection?.removeAllRanges();
+    selection?.addRange(nextRange);
+    return nextRange;
+}
+
+function stmnInsertTextSizeTypingMarker(range, editor, sizeId) {
+    if (!range?.collapsed) return range;
+    const startElement = range.startContainer.nodeType === Node.ELEMENT_NODE
+        ? range.startContainer
+        : range.startContainer.parentElement;
+    const activeMarker = startElement?.closest?.('[data-stmn-typing-size]');
+    if (activeMarker && editor.contains(activeMarker)) {
+        activeMarker.dataset.stmnTextSize = sizeId;
+        if (!activeMarker.textContent.includes(STMN_TYPING_MARKER)) activeMarker.append(document.createTextNode(STMN_TYPING_MARKER));
+        const textNode = [...activeMarker.childNodes].find(node => node.nodeType === Node.TEXT_NODE && node.nodeValue.includes(STMN_TYPING_MARKER))
+            || [...activeMarker.childNodes].find(node => node.nodeType === Node.TEXT_NODE)
+            || activeMarker.appendChild(document.createTextNode(STMN_TYPING_MARKER));
+        const nextRange = document.createRange();
+        nextRange.setStart(textNode, textNode.nodeValue.length);
+        nextRange.collapse(true);
+        const selection = globalThis.getSelection?.();
+        selection?.removeAllRanges();
+        selection?.addRange(nextRange);
+        return nextRange;
+    }
+    const marker = document.createElement('span');
+    marker.dataset.stmnTextSize = sizeId;
+    marker.dataset.stmnTypingSize = 'true';
+    const text = document.createTextNode(STMN_TYPING_MARKER);
+    marker.append(text);
+    range.insertNode(marker);
+    const nextRange = document.createRange();
+    nextRange.setStart(text, text.nodeValue.length);
+    nextRange.collapse(true);
+    const selection = globalThis.getSelection?.();
+    selection?.removeAllRanges();
+    selection?.addRange(nextRange);
+    return nextRange;
+}
+
 function stmnRepairLiveEditor(editor) {
     if (!editor) return;
+    stmnNormalizeTextSizeMarkup(editor);
     if (!editor.childNodes.length) editor.innerHTML = stmnTextLineMarkup();
     for (const node of [...editor.childNodes]) {
         if (node.nodeType === Node.TEXT_NODE) {
@@ -1134,34 +1383,8 @@ function stmnRepairLiveEditor(editor) {
             continue;
         }
         if (!node.dataset.stmnLine) node.dataset.stmnLine = 'text';
-        node.classList.add('stmn-editor-line');
-        if (node.dataset.stmnLine === 'check') {
-            node.classList.add('stmn-check-line');
-            let marker = node.querySelector(':scope > .stmn-inline-checkbox');
-            let content = node.querySelector(':scope > .stmn-check-content');
-            if (!content) {
-                content = document.createElement('span');
-                content.className = 'stmn-check-content';
-                const movable = [...node.childNodes].filter(child => child !== marker);
-                content.append(...movable);
-                node.append(content);
-            }
-            if (!marker) {
-                marker = document.createElement('span');
-                marker.className = 'stmn-inline-checkbox';
-                marker.contentEditable = 'false';
-                marker.setAttribute('role', 'checkbox');
-                marker.tabIndex = -1;
-                node.prepend(marker);
-            }
-            const escapedContent = [...node.childNodes].filter(child => child !== marker && child !== content);
-            if (escapedContent.length) content.append(...escapedContent);
-            const done = node.dataset.checked === 'true';
-            marker.textContent = done ? '✓' : '';
-            marker.setAttribute('aria-checked', String(done));
-            node.classList.toggle('is-done', done);
-            if (!content.childNodes.length) content.append(document.createElement('br'));
-        }
+        if (node.dataset.stmnLine === 'check') stmnEnsureCheckLine(node);
+        else stmnEnsureTextLine(node);
     }
     if (!editor.childNodes.length) editor.innerHTML = stmnTextLineMarkup();
 }
@@ -1176,6 +1399,7 @@ function stmnSyncEditor(note, editor, immediate = false) {
 
 function stmnEditorHtmlForStorage(editor, normalize = false) {
     const clean = editor.cloneNode(true);
+    stmnCleanupTextSizeTypingMarkers(clean, true);
     clean.querySelectorAll('.stmn-has-find-match, .stmn-is-find-current').forEach(element => {
         element.classList.remove('stmn-has-find-match', 'stmn-is-find-current');
     });
@@ -1196,6 +1420,8 @@ function stmnCaretOffsetIn(element, range) {
 
 function stmnConvertLine(line, type, caretOffset = 0) {
     if (!line) return null;
+    if (line.dataset.stmnLine === 'check') stmnEnsureCheckLine(line);
+    else stmnEnsureTextLine(line);
     const oldContent = stmnLineContent(line);
     const fragment = document.createDocumentFragment();
     fragment.append(...oldContent.childNodes);
@@ -1204,25 +1430,20 @@ function stmnConvertLine(line, type, caretOffset = 0) {
     line.dataset.stmnLine = type;
     delete line.dataset.checked;
     if (type === 'check') {
-        line.classList.add('stmn-check-line');
-        line.dataset.checked = 'false';
-        const marker = document.createElement('span');
-        marker.className = 'stmn-inline-checkbox';
-        marker.contentEditable = 'false';
-        marker.setAttribute('role', 'checkbox');
-        marker.setAttribute('aria-checked', 'false');
-        marker.tabIndex = -1;
-        const content = document.createElement('span');
-        content.className = 'stmn-check-content';
+        const template = stmnCreateCheckLineElement(false);
+        const marker = template.querySelector(':scope > .stmn-inline-checkbox');
+        const content = template.querySelector(':scope > .stmn-check-content');
+        content.replaceChildren();
         content.append(fragment);
-        if (!content.childNodes.length) content.append(document.createElement('br'));
+        stmnEnsureEditableContent(content);
+        line.className = template.className;
+        line.dataset.stmnLine = 'check';
+        line.dataset.checked = 'false';
         line.append(marker, content);
-        stmnSetCaretAtTextOffset(content, caretOffset);
         return content;
     }
     line.append(fragment);
-    if (!line.childNodes.length) line.append(document.createElement('br'));
-    stmnSetCaretAtTextOffset(line, caretOffset);
+    stmnEnsureEditableContent(line);
     return line;
 }
 
@@ -1236,14 +1457,15 @@ function stmnToggleChecklist(note, editor, text = null) {
     }
     const content = stmnLineContent(line);
     const offset = stmnCaretOffsetIn(content, range);
-    stmnConvertLine(line, line.dataset.stmnLine === 'check' ? 'text' : 'check', offset);
+    let target = stmnConvertLine(line, line.dataset.stmnLine === 'check' ? 'text' : 'check', offset);
     if (text !== null) {
-        const target = stmnLineContent(line);
+        target = stmnLineContent(line);
         target.textContent = text;
-        stmnSetCaret(target, 'end');
     }
-    stmnRememberEditorSelection(note.id, editor);
     stmnSyncEditor(note, editor, true);
+    if (text !== null) stmnSetCaret(target, 'end');
+    else stmnSetCaretAtTextOffset(target, offset);
+    stmnRememberEditorSelection(note.id, editor);
 }
 
 function stmnAppendChecklist(note, text = '') {
@@ -1255,16 +1477,39 @@ function stmnAppendChecklist(note, text = '') {
         stmnRenderNotes();
         return;
     }
-    const holder = document.createElement('div');
-    holder.innerHTML = stmnCheckLineMarkup(stmnEscapeHtml(text));
-    const line = holder.firstElementChild;
+    const line = stmnCreateCheckLineElement(false);
     editor.append(line);
     const content = stmnLineContent(line);
-    stmnSetCaretAtTextOffset(content, (content.textContent || '').length);
+    content.textContent = text;
+    stmnEnsureEditableContent(content);
     stmnSyncEditor(note, editor, true);
+    stmnSetCaretAtTextOffset(content, (content.textContent || '').length);
+    stmnRememberEditorSelection(note.id, editor);
 }
 
-function stmnHandleChecklistKey(event, note, editor) {
+function stmnSplitCheckLineAtRange(line, range) {
+    const content = stmnEnsureCheckLine(line);
+    const next = stmnCreateCheckLineElement(false);
+    const nextContent = stmnLineContent(next);
+    const splitRange = range.cloneRange();
+    if (!content.contains(splitRange.startContainer)) {
+        splitRange.selectNodeContents(content);
+        splitRange.collapse(false);
+    }
+    const tailRange = document.createRange();
+    tailRange.selectNodeContents(content);
+    tailRange.setStart(splitRange.startContainer, splitRange.startOffset);
+    const tail = tailRange.extractContents();
+    nextContent.replaceChildren(tail);
+    stmnEnsureEditableContent(content);
+    stmnEnsureEditableContent(nextContent);
+    line.after(next);
+    return next;
+}
+
+function stmnHandleChecklistBeforeInput(event, note, editor) {
+    if (event.isComposing || event.keyCode === 229 || stmnComposingEditors.has(editor)) return false;
+    if (event.inputType !== 'deleteContentBackward' && event.inputType !== 'insertParagraph') return false;
     const selection = globalThis.getSelection?.();
     if (!selection?.rangeCount || !selection.isCollapsed) return false;
     const range = selection.getRangeAt(0);
@@ -1272,45 +1517,29 @@ function stmnHandleChecklistKey(event, note, editor) {
     if (!line || line.dataset.stmnLine !== 'check') return false;
     const content = stmnLineContent(line);
     const offset = stmnCaretOffsetIn(content, range);
-    if (event.key === 'Backspace' && offset === 0) {
+    if (event.inputType === 'deleteContentBackward' && offset === 0) {
         event.preventDefault();
-        stmnConvertLine(line, 'text', 0);
+        const target = stmnConvertLine(line, 'text', 0);
         stmnSyncEditor(note, editor, true);
+        stmnSetCaretAtTextOffset(target, 0);
+        stmnRememberEditorSelection(note.id, editor);
         return true;
     }
-    if (event.key !== 'Enter' || event.shiftKey) return false;
+    if (event.inputType !== 'insertParagraph') return false;
     event.preventDefault();
     const value = (content.textContent || '').replace(/\u200B/g, '');
     if (!value.trim() && !content.querySelector('[data-stmn-image]')) {
-        stmnConvertLine(line, 'text', 0);
+        const target = stmnConvertLine(line, 'text', 0);
         stmnSyncEditor(note, editor, true);
+        stmnSetCaretAtTextOffset(target, 0);
+        stmnRememberEditorSelection(note.id, editor);
         return true;
     }
-    const holder = document.createElement('div');
-    holder.innerHTML = stmnCheckLineMarkup();
-    const next = holder.firstElementChild;
+    const next = stmnSplitCheckLineAtRange(line, range);
     const nextContent = stmnLineContent(next);
-    if (content.contains(range.startContainer)) {
-        const beforeRange = document.createRange();
-        beforeRange.selectNodeContents(content);
-        beforeRange.setEnd(range.startContainer, range.startOffset);
-        const afterRange = document.createRange();
-        afterRange.selectNodeContents(content);
-        afterRange.setStart(range.startContainer, range.startOffset);
-        const beforeFragment = beforeRange.cloneContents();
-        const afterFragment = afterRange.cloneContents();
-        content.replaceChildren(beforeFragment);
-        nextContent.replaceChildren(afterFragment);
-    } else {
-        content.textContent = value.slice(0, offset);
-        nextContent.textContent = value.slice(offset);
-    }
-    if (!content.childNodes.length) content.append(document.createElement('br'));
-    if (!nextContent.childNodes.length) nextContent.append(document.createElement('br'));
-    line.after(next);
+    stmnSyncEditor(note, editor, true);
     stmnSetCaretAtTextOffset(nextContent, 0);
     stmnRememberEditorSelection(note.id, editor);
-    stmnSyncEditor(note, editor, true);
     return true;
 }
 
@@ -1318,7 +1547,7 @@ function stmnRemoveInlineImage(note, editor, image) {
     if (!image) return;
     const line = image.closest('[data-stmn-line]');
     image.remove();
-    if (line && !line.textContent && !line.querySelector('[data-stmn-image]')) line.innerHTML = '<br>';
+    if (line) stmnEnsureEditableContent(stmnLineContent(line));
     stmnSelectedImages.delete(note.id);
     stmnSyncEditor(note, editor, true);
     editor.focus();
@@ -1359,14 +1588,23 @@ function stmnBindCard(card, note) {
     });
     card.querySelector('.stmn-title-input').addEventListener('blur', stmnSaveNow);
 
-    editor.addEventListener('focus', () => card.classList.add('is-editing'));
-    editor.addEventListener('blur', async () => {
+    editor.addEventListener('focus', () => {
+        card.classList.add('is-editing');
+        stmnUpdateFormatControls(card, editor);
+    });
+    let compositionSyncTimer = null;
+    editor.addEventListener('blur', async event => {
+        if (compositionSyncTimer !== null) clearTimeout(compositionSyncTimer);
+        compositionSyncTimer = null;
+        stmnComposingEditors.delete(editor);
+        stmnSettlingEditors.delete(editor);
         card.classList.remove('is-editing');
+        if (!event.relatedTarget?.closest?.('[data-format-size]')) stmnCleanupTextSizeTypingMarkers(editor, true);
         note.contentHtml = stmnEditorHtmlForStorage(editor, true);
         await stmnSaveNow();
         stmnUpdateOverflow(card);
     });
-    editor.addEventListener('input', event => {
+    const syncEditorInput = event => {
         const activeCaption = event.target.closest?.('.stmn-inline-image-caption');
         const activeImage = activeCaption?.closest?.('.stmn-inline-image');
         if (activeCaption && activeImage) {
@@ -1374,15 +1612,60 @@ function stmnBindCard(card, note) {
             const image = activeImage.querySelector('img');
             if (image) image.alt = activeImage.dataset.caption || activeImage.dataset.name || '이미지';
         }
-        stmnRepairLiveEditor(editor);
+        stmnCleanupTextSizeTypingMarkers(editor);
         stmnRememberEditorSelection(note.id, editor);
         stmnSyncEditor(note, editor);
         stmnUpdateOverflow(card);
+        stmnUpdateFormatControls(card, editor);
+    };
+    const scheduleCompositionSync = event => {
+        const target = event.target || editor;
+        if (compositionSyncTimer !== null) clearTimeout(compositionSyncTimer);
+        compositionSyncTimer = setTimeout(() => {
+            compositionSyncTimer = null;
+            stmnSettlingEditors.delete(editor);
+            if (!stmnComposingEditors.has(editor)) syncEditorInput({ target });
+        }, STMN_IME_SETTLE_MS);
+    };
+    editor.addEventListener('compositionstart', () => {
+        if (compositionSyncTimer !== null) clearTimeout(compositionSyncTimer);
+        compositionSyncTimer = null;
+        stmnSettlingEditors.delete(editor);
+        stmnComposingEditors.add(editor);
     });
-    editor.addEventListener('keyup', () => stmnRememberEditorSelection(note.id, editor));
-    editor.addEventListener('pointerup', () => stmnRememberEditorSelection(note.id, editor));
+    editor.addEventListener('compositionend', event => {
+        stmnComposingEditors.delete(editor);
+        stmnSettlingEditors.add(editor);
+        scheduleCompositionSync(event);
+    });
+    editor.addEventListener('input', event => {
+        if (event.isComposing || stmnComposingEditors.has(editor)) return;
+        if (compositionSyncTimer !== null) {
+            scheduleCompositionSync(event);
+            return;
+        }
+        syncEditorInput(event);
+    });
+    editor.addEventListener('beforeinput', event => {
+        if (event.target.closest?.('.stmn-inline-image-caption')) return;
+        if (event.isComposing || stmnComposingEditors.has(editor)) return;
+        if (event.inputType !== 'insertParagraph' && event.inputType !== 'deleteContentBackward') return;
+        if (compositionSyncTimer !== null) clearTimeout(compositionSyncTimer);
+        compositionSyncTimer = null;
+        stmnSettlingEditors.delete(editor);
+        stmnHandleChecklistBeforeInput(event, note, editor);
+    });
+    editor.addEventListener('keyup', () => {
+        stmnRememberEditorSelection(note.id, editor);
+        stmnUpdateFormatControls(card, editor);
+    });
+    editor.addEventListener('pointerup', () => {
+        stmnRememberEditorSelection(note.id, editor);
+        stmnUpdateFormatControls(card, editor);
+    });
     editor.addEventListener('keydown', event => {
         if (event.target.closest?.('.stmn-inline-image-caption')) return;
+        if (event.isComposing || event.keyCode === 229 || stmnComposingEditors.has(editor)) return;
         const selectedImage = stmnSelectedImages.get(note.id);
         if (selectedImage && (event.key === 'Backspace' || event.key === 'Delete')) {
             event.preventDefault();
@@ -1399,7 +1682,6 @@ function stmnBindCard(card, note) {
                 return;
             }
         }
-        stmnHandleChecklistKey(event, note, editor);
     });
     editor.addEventListener('paste', event => {
         const image = [...(event.clipboardData?.files || [])].find(file => file.type.startsWith('image/'));
@@ -1443,10 +1725,10 @@ function stmnBindCard(card, note) {
         }
     });
 
-    card.querySelectorAll('.stmn-card-tools [data-action], [data-highlight]').forEach(button => {
-        button.addEventListener('pointerdown', event => {
+    card.querySelectorAll('[data-action], [data-highlight], [data-format-command], [data-format-size]').forEach(control => {
+        control.addEventListener('pointerdown', event => {
             stmnRememberEditorSelection(note.id, editor);
-            if (button.dataset.action === 'toggle-check' || button.dataset.highlight) event.preventDefault();
+            if (control.dataset.action === 'toggle-check' || control.dataset.highlight || control.dataset.formatCommand) event.preventDefault();
         });
     });
 
@@ -1481,6 +1763,13 @@ function stmnBindCard(card, note) {
         button.addEventListener('click', () => stmnApplyHighlight(note, editor, button.dataset.highlight));
     });
 
+    card.querySelectorAll('[data-format-command]').forEach(button => {
+        button.addEventListener('click', () => stmnApplyTextFormat(note, editor, button.dataset.formatCommand));
+    });
+    card.querySelector('[data-format-size]')?.addEventListener('change', event => {
+        stmnApplyTextSize(note, editor, event.target.value);
+    });
+
     fileInput.addEventListener('change', async () => {
         const file = fileInput.files?.[0];
         const point = stmnPendingImageRanges.get(note.id) || null;
@@ -1507,23 +1796,144 @@ function stmnBindCard(card, note) {
     requestAnimationFrame(() => stmnUpdateOverflow(card));
 }
 
-function stmnApplyHighlight(note, editor, color) {
-    const selection = globalThis.getSelection?.();
-    const saved = stmnSelectedRanges.get(note.id);
-    if (saved && editor.contains(saved.commonAncestorContainer)) {
-        selection.removeAllRanges();
-        selection.addRange(saved);
+function stmnColorChannels(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized || normalized === 'transparent') return null;
+    const hex = normalized.match(/^#([\da-f]{3}|[\da-f]{6}|[\da-f]{8})$/i)?.[1];
+    if (hex) {
+        const full = hex.length === 3 ? [...hex].map(character => character + character).join('') : hex;
+        if (full.length === 8 && Number.parseInt(full.slice(6, 8), 16) === 0) return null;
+        return [0, 2, 4].map(index => Number.parseInt(full.slice(index, index + 2), 16));
     }
-    editor.focus();
+    const rgb = normalized.match(/^rgba?\(\s*([\d.]+)[, ]+\s*([\d.]+)[, ]+\s*([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/i);
+    if (!rgb) return null;
+    if (rgb[4] && (rgb[4] === '0' || rgb[4] === '0%' || Number.parseFloat(rgb[4]) === 0)) return null;
+    return rgb.slice(1, 4).map(channel => Math.round(Number.parseFloat(channel)));
+}
+
+function stmnColorsMatch(first, second) {
+    const a = Array.isArray(first) ? first : stmnColorChannels(first);
+    const b = Array.isArray(second) ? second : stmnColorChannels(second);
+    return Boolean(a && b && a.every((channel, index) => Math.abs(channel - b[index]) <= 1));
+}
+
+function stmnNodeHighlightColor(node, editor) {
+    let element = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    if (!(element instanceof HTMLElement)) return null;
+    while (element && editor.contains(element)) {
+        const color = globalThis.getComputedStyle?.(element)?.backgroundColor || element.style?.backgroundColor;
+        const channels = stmnColorChannels(color);
+        if (channels) return channels;
+        if (element === editor) break;
+        element = element.parentElement;
+    }
+    return null;
+}
+
+function stmnRangeHasHighlightColor(range, editor, color) {
+    const target = stmnColorChannels(color);
+    if (!range || !target) return false;
+    if (range.collapsed) {
+        try {
+            const commandColor = document.queryCommandValue?.('hiliteColor') || document.queryCommandValue?.('backColor');
+            if (stmnColorsMatch(commandColor, target)) return true;
+        } catch {
+            // 커서 주변 DOM 색상 확인으로 이어집니다.
+        }
+        let node = range.startContainer;
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            node = node.childNodes[Math.max(0, range.startOffset - 1)] || node.childNodes[range.startOffset] || node;
+        }
+        return stmnColorsMatch(stmnNodeHighlightColor(node, editor), target);
+    }
+    const portions = stmnTextNodesInRange(range, editor).filter(node => {
+        const start = node === range.startContainer ? range.startOffset : 0;
+        const end = node === range.endContainer ? range.endOffset : node.nodeValue.length;
+        return end > start;
+    });
+    return portions.length > 0 && portions.every(node => stmnColorsMatch(stmnNodeHighlightColor(node, editor), target));
+}
+
+function stmnApplyHighlight(note, editor, color) {
+    const range = stmnRestoreEditorSelection(note.id, editor);
+    const appliedColor = color !== 'transparent' && stmnRangeHasHighlightColor(range, editor, color) ? 'transparent' : color;
     try {
-        document.execCommand('styleWithCSS', false, true);
-        document.execCommand('hiliteColor', false, color);
-        if (color === 'transparent') document.execCommand('backColor', false, 'transparent');
+        document.execCommand('styleWithCSS', false, 'true');
+        document.execCommand('hiliteColor', false, appliedColor);
+        if (appliedColor === 'transparent') document.execCommand('backColor', false, 'transparent');
     } catch (error) {
         console.warn('[ChatSSi MeMo] Highlight command failed', error);
     }
     stmnSelectedRanges.delete(note.id);
     stmnSyncEditor(note, editor, true);
+    stmnUpdateFormatControls(editor.closest('.stmn-card'), editor);
+}
+
+function stmnRestoreEditorSelection(noteId, editor) {
+    const usable = stmnUsableRange(noteId, editor);
+    const saved = usable?.cloneRange?.() || null;
+    editor.focus({ preventScroll: true });
+    const selection = globalThis.getSelection?.();
+    if (selection && saved && editor.contains(saved.commonAncestorContainer)) {
+        selection.removeAllRanges();
+        selection.addRange(saved);
+    } else if (!saved) {
+        stmnSetCaret(editor, 'end');
+    }
+    const active = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    return active && editor.contains(active.commonAncestorContainer) ? active : null;
+}
+
+function stmnCommandState(command) {
+    try {
+        return Boolean(document.queryCommandState?.(command));
+    } catch {
+        return false;
+    }
+}
+
+function stmnUpdateFormatControls(card, editor) {
+    if (!card || !editor) return;
+    const selection = globalThis.getSelection?.();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    if (!range || !editor.contains(range.commonAncestorContainer)) return;
+    card.querySelectorAll('[data-format-command]').forEach(button => {
+        const active = stmnCommandState(button.dataset.formatCommand);
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-pressed', String(active));
+    });
+    const select = card.querySelector('[data-format-size]');
+    if (select) select.value = '';
+}
+
+function stmnApplyTextFormat(note, editor, command) {
+    stmnRestoreEditorSelection(note.id, editor);
+    try {
+        document.execCommand('styleWithCSS', false, 'true');
+        document.execCommand(command, false, null);
+    } catch (error) {
+        console.warn('[ChatSSi MeMo] Text formatting command failed', error);
+    }
+    stmnRememberEditorSelection(note.id, editor);
+    stmnSyncEditor(note, editor, true);
+    stmnUpdateFormatControls(editor.closest('.stmn-card'), editor);
+}
+
+function stmnApplyTextSize(note, editor, sizeId) {
+    const size = STMN_TEXT_SIZES.find(item => item.id === sizeId);
+    const select = editor.closest('.stmn-card')?.querySelector('[data-format-size]');
+    if (!size) {
+        if (select) select.value = '';
+        return;
+    }
+    const range = stmnRestoreEditorSelection(note.id, editor);
+    if (!range) return;
+    if (range.collapsed) stmnInsertTextSizeTypingMarker(range, editor, size.id);
+    else stmnApplyTextSizeToRange(range, editor, size.id);
+    stmnRememberEditorSelection(note.id, editor);
+    stmnSyncEditor(note, editor, true);
+    if (select) select.value = '';
+    stmnUpdateFormatControls(editor.closest('.stmn-card'), editor);
 }
 
 function stmnBindCardResize(card, note) {
@@ -2418,7 +2828,7 @@ async function stmnInit() {
     });
     setTimeout(stmnAddWandButton, 1200);
     setTimeout(stmnAddSettingsPanel, 1200);
-    console.info('[ChatSSi MeMo] v1.1.2 loaded');
+    console.info('[ChatSSi MeMo] v1.3.5 loaded');
 }
 
 if (document.readyState === 'loading') {
