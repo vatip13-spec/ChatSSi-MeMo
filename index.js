@@ -2418,7 +2418,7 @@ async function stmnInit() {
     });
     setTimeout(stmnAddWandButton, 1200);
     setTimeout(stmnAddSettingsPanel, 1200);
-    console.info('[ChatSSi MeMo] v1.1.1 loaded');
+    console.info('[ChatSSi MeMo] v1.1.2 loaded');
 }
 
 if (document.readyState === 'loading') {

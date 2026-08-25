@@ -619,11 +619,9 @@ html body #stmn-panel#stmn-panel.stmn-font-override .stmn-card * {
 
 .is-manual-height .stmn-card-main {
     min-height: 0;
-    overflow: hidden;
-}
-
-.is-manual-height.is-editing .stmn-card-main {
-    overflow: auto;
+    overflow-x: hidden;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
 }
 
 .is-collapsed .stmn-card-tools,
