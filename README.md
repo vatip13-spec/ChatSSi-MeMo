@@ -73,22 +73,6 @@ Git으로 설치하면 확장 관리 화면에서 이후 버전을 확인하고 
 4. SillyTavern을 완전히 새로고침합니다.
 5. 플로팅 메모 아이콘, 완드 메뉴의 `챗시 노트`, 또는 `/memo` 명령으로 엽니다.
 
-## GitHub 저장소 구조
-
-저장소 루트에 다음 파일을 그대로 올립니다.
-
-```text
-ChatSSi-MeMo/
-├─ manifest.json
-├─ index.js
-├─ style.css
-├─ icon.png
-├─ README.md
-├─ LICENSE
-└─ .gitignore
-```
-
-이후 업데이트에서는 같은 이름의 `index.js`와 `style.css`를 수정하고 `manifest.json`의 버전만 올리면 됩니다. 파일명에 버전 번호를 붙이지 않으므로 이전 파일을 삭제할 필요가 없습니다.
 
 ## 슬래시 커맨드
 
