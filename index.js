@@ -1,6 +1,14 @@
 const STMN_MODULE = 'st_private_notes';
 const STMN_CHAT_KEY = 'st_private_notes_v1';
 const STMN_VERSION = 4;
+const STMN_DATA_SCHEMA = 2;
+const STMN_BACKUP_SCHEMA = 1;
+const STMN_INDEX_FILE = 'chatssi_memo_index.json';
+const STMN_INDEX_PREVIOUS_FILE = 'chatssi_memo_index.previous.json';
+const STMN_OWNER_FILE_PREFIX = 'chatssi_memo_owner_';
+const STMN_IMAGE_FILE_PREFIX = 'chatssi_memo_img_';
+const STMN_LEASE_MS = 90_000;
+const STMN_LEASE_RENEW_MS = 30_000;
 
 const STMN_DEFAULT_SETTINGS = Object.freeze({
     showFloatingButton: true,
@@ -85,6 +93,9 @@ const STMN_MAX_IMAGES = 6;
 const STMN_IMAGE_MAX_SIDE = 1280;
 const STMN_TYPING_MARKER = '\u200B';
 const STMN_IME_SETTLE_MS = 120;
+const STMN_KEYBOARD_MIN_SHRINK = 140;
+const STMN_KEYBOARD_SHRINK_RATIO = 0.16;
+const STMN_VIEWPORT_SETTLE_MS = 180;
 
 let stmnPanelOpen = false;
 let stmnSearch = '';
@@ -103,6 +114,26 @@ const stmnSettlingEditors = new WeakSet();
 let stmnPanelObserver = null;
 let stmnActiveFontResource = null;
 const stmnNormalizedStores = new WeakSet();
+let stmnStableViewport = null;
+let stmnViewportTimer = null;
+let stmnKeyboardOpen = false;
+let stmnKeyboardPanelRect = null;
+let stmnStorageRuntime = null;
+let stmnStorageLoadToken = 0;
+let stmnIndexWriteQueue = Promise.resolve();
+let stmnLeaseTimer = null;
+let stmnBackupBusy = false;
+const stmnOwnerWriteQueues = new Map();
+
+function stmnMarkRuntimeDirty(runtime = stmnStorageRuntime) {
+    if (!runtime || runtime.status !== 'ready' || runtime.readOnly) return false;
+    runtime.changeVersion = Number(runtime.changeVersion || 0) + 1;
+    runtime.dirty = true;
+    if (runtime === stmnStorageRuntime) {
+        document.querySelector('#stmn-save-state')?.classList.add('is-saving');
+    }
+    return true;
+}
 
 function stmnContext() {
     return globalThis.SillyTavern?.getContext?.();
@@ -119,15 +150,36 @@ function stmnClamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
 
-function stmnViewport() {
+function stmnMeasureLayoutViewport() {
+    const root = document.documentElement;
     return {
-        width: Math.round(globalThis.visualViewport?.width || globalThis.innerWidth || 1024),
-        height: Math.round(globalThis.visualViewport?.height || globalThis.innerHeight || 768),
+        width: Math.round(globalThis.innerWidth || root?.clientWidth || 1024),
+        height: Math.round(globalThis.innerHeight || root?.clientHeight || 768),
     };
 }
 
-function stmnMode() {
-    const { width, height } = stmnViewport();
+function stmnVisibleViewport() {
+    const layout = stmnMeasureLayoutViewport();
+    const viewport = globalThis.visualViewport;
+    return {
+        width: Math.round(viewport?.width || layout.width),
+        height: Math.round(viewport?.height || layout.height),
+        offsetLeft: Math.round(viewport?.offsetLeft || 0),
+        offsetTop: Math.round(viewport?.offsetTop || 0),
+    };
+}
+
+function stmnCommitStableViewport() {
+    stmnStableViewport = stmnMeasureLayoutViewport();
+    return stmnStableViewport;
+}
+
+function stmnViewport() {
+    return stmnStableViewport || stmnCommitStableViewport();
+}
+
+function stmnMode(viewport = stmnViewport()) {
+    const { width, height } = viewport;
     const shortSide = Math.min(width, height);
     const landscape = width > height;
     if (width >= 1100) return 'desktop';
@@ -138,6 +190,71 @@ function stmnMode() {
 
 function stmnIsSideMode(mode = stmnMode()) {
     return mode === 'desktop' || mode === 'tablet-landscape';
+}
+
+function stmnHasEditableFocus() {
+    const active = document.activeElement;
+    if (!(active instanceof Element)) return false;
+    return Boolean(active.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])'));
+}
+
+function stmnKeyboardLikelyOpen() {
+    if (!globalThis.visualViewport || !stmnHasEditableFocus()) return false;
+    return stmnVisibleViewportReduced();
+}
+
+function stmnVisibleViewportReduced() {
+    if (!globalThis.visualViewport) return false;
+    const stable = stmnViewport();
+    const visible = stmnVisibleViewport();
+    const widthTolerance = Math.max(48, stable.width * 0.08);
+    const heightShrink = stable.height - visible.height;
+    const shrinkThreshold = Math.max(STMN_KEYBOARD_MIN_SHRINK, stable.height * STMN_KEYBOARD_SHRINK_RATIO);
+    return Math.abs(stable.width - visible.width) <= widthTolerance && heightShrink >= shrinkThreshold;
+}
+
+function stmnClearKeyboardViewport(panel = document.querySelector('#stmn-panel')) {
+    stmnKeyboardOpen = false;
+    stmnKeyboardPanelRect = null;
+    document.body?.classList.remove('stmn-keyboard-open');
+    if (!panel) return;
+    panel.classList.remove('stmn-keyboard-open');
+    delete panel.dataset.keyboardViewport;
+}
+
+function stmnApplyKeyboardViewport(panel = document.querySelector('#stmn-panel')) {
+    if (!panel || !stmnPanelOpen) return;
+    const visible = stmnVisibleViewport();
+    const mode = stmnMode();
+    const visibleTop = visible.offsetTop;
+    const visibleBottom = visibleTop + visible.height;
+
+    if (!stmnKeyboardPanelRect) {
+        const rect = panel.getBoundingClientRect();
+        stmnKeyboardPanelRect = {
+            top: rect.top,
+            height: rect.height,
+        };
+    }
+
+    stmnKeyboardOpen = true;
+    document.body?.classList.add('stmn-keyboard-open');
+    panel.classList.add('stmn-keyboard-open');
+    panel.dataset.keyboardViewport = 'true';
+
+    if (stmnIsSideMode(mode)) {
+        panel.style.setProperty('top', `${visibleTop}px`, 'important');
+        panel.style.setProperty('bottom', 'auto', 'important');
+        panel.style.setProperty('height', `${Math.max(1, visible.height)}px`, 'important');
+        return;
+    }
+
+    const base = stmnKeyboardPanelRect;
+    const top = stmnClamp(base.top, visibleTop, Math.max(visibleTop, visibleBottom - 1));
+    const height = Math.max(1, Math.min(base.height, visibleBottom - top));
+    panel.style.setProperty('top', `${Math.round(top)}px`, 'important');
+    panel.style.setProperty('bottom', 'auto', 'important');
+    panel.style.setProperty('height', `${Math.round(height)}px`, 'important');
 }
 
 function stmnSidePanelBounds(mode, viewportWidth) {
@@ -570,9 +687,12 @@ function stmnHasChat() {
 function stmnImageMarkup(image) {
     const name = stmnEscapeAttr(typeof image?.name === 'string' ? image.name : '이미지');
     const caption = stmnEscapeAttr(typeof image?.caption === 'string' ? image.caption : '');
-    const dataUrl = typeof image?.dataUrl === 'string' && image.dataUrl.startsWith('data:image/') ? stmnEscapeAttr(image.dataUrl) : '';
-    if (!dataUrl) return '';
-    return `<span class="stmn-inline-image" data-stmn-image="true" data-name="${name}" data-caption="${caption}" contenteditable="false" tabindex="0"><span class="stmn-inline-image-frame"><img src="${dataUrl}" alt="${caption || name}" draggable="false"><button type="button" class="stmn-inline-image-remove" data-remove-image="true" title="이미지 삭제" aria-label="이미지 삭제">×</button></span><span class="stmn-inline-image-caption" contenteditable="true" role="textbox" data-placeholder="이미지 설명">${caption}</span></span>`;
+    const source = typeof image?.dataUrl === 'string' && image.dataUrl.startsWith('data:image/')
+        ? image.dataUrl
+        : typeof image?.src === 'string' && (image.src.startsWith('/user/files/') || image.src.startsWith('data:image/')) ? image.src : '';
+    const imageId = typeof image?.id === 'string' ? stmnEscapeAttr(image.id) : '';
+    if (!source) return '';
+    return `<span class="stmn-inline-image" data-stmn-image="true"${imageId ? ` data-stmn-image-id="${imageId}"` : ''} data-name="${name}" data-caption="${caption}" contenteditable="false" tabindex="0"><span class="stmn-inline-image-frame"><img src="${stmnEscapeAttr(source)}" alt="${caption || name}" draggable="false"><button type="button" class="stmn-inline-image-remove" data-remove-image="true" title="이미지 삭제" aria-label="이미지 삭제">×</button></span><span class="stmn-inline-image-caption" contenteditable="true" role="textbox" data-placeholder="이미지 설명">${caption}</span></span>`;
 }
 
 function stmnTextLineMarkup(html = '') {
@@ -716,21 +836,16 @@ function stmnNormalizeNote(note, index) {
         height: Number.isFinite(note?.height) ? stmnClamp(note.height, 190, 1200) : null,
         createdAt: Number.isFinite(note?.createdAt) ? note.createdAt : Date.now(),
         updatedAt: Number.isFinite(note?.updatedAt) ? note.updatedAt : Date.now(),
+        migrationSource: typeof note?.migrationSource === 'string' ? note.migrationSource : '',
     };
     if (normalized.heightMode === 'manual' && !normalized.height) normalized.height = 260;
     return normalized;
 }
 
-function stmnStore(create = true) {
-    const context = stmnContext();
-    if (!context || !stmnHasChat()) return null;
-    const metadata = context.chatMetadata;
-    if (!metadata || typeof metadata !== 'object') return null;
-    if (!metadata[STMN_CHAT_KEY]) {
-        if (!create) return null;
-        metadata[STMN_CHAT_KEY] = { version: STMN_VERSION, notes: [], selectedId: null };
-    }
-    const store = metadata[STMN_CHAT_KEY];
+function stmnNormalizeStoreObject(input) {
+    const store = input && typeof input === 'object'
+        ? input
+        : { version: STMN_VERSION, notes: [], selectedId: null };
     if (!stmnNormalizedStores.has(store)) {
         store.version = STMN_VERSION;
         store.notes = Array.isArray(store.notes) ? store.notes.map(stmnNormalizeNote) : [];
@@ -742,35 +857,852 @@ function stmnStore(create = true) {
     return store;
 }
 
-function stmnCurrentMetadata() {
-    return stmnContext()?.chatMetadata ?? null;
+function stmnStore(_create = true) {
+    return stmnStorageRuntime?.status === 'ready'
+        ? stmnNormalizeStoreObject(stmnStorageRuntime.payload.store)
+        : null;
 }
 
-async function stmnSaveNow() {
+function stmnRequestHeaders() {
+    const context = stmnContext();
+    const headers = context?.getRequestHeaders?.() || globalThis.getRequestHeaders?.();
+    if (!headers) throw new Error('실리태번 파일 API 인증 정보를 가져오지 못했습니다.');
+    return headers;
+}
+
+function stmnUtf8ToBase64(text) {
+    const bytes = new TextEncoder().encode(String(text));
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    }
+    return btoa(binary);
+}
+
+function stmnBase64ToBytes(value) {
+    const binary = atob(String(value || '').replace(/\s/g, ''));
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return bytes;
+}
+
+function stmnBytesToBase64(bytes) {
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    }
+    return btoa(binary);
+}
+
+async function stmnSha256(value) {
+    const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function stmnJsonForHash(payload) {
+    const clone = structuredClone(payload);
+    delete clone.payloadHash;
+    return JSON.stringify(clone);
+}
+
+async function stmnSealPayload(payload) {
+    const sealed = structuredClone(payload);
+    sealed.payloadHash = await stmnSha256(stmnJsonForHash(sealed));
+    return sealed;
+}
+
+async function stmnValidatePayload(payload, type, identity = null) {
+    if (!payload || payload.app !== 'ChatSSi MeMo' || payload.schema !== STMN_DATA_SCHEMA || payload.type !== type) {
+        throw new Error('챗시 노트 데이터파일 형식이 올바르지 않습니다.');
+    }
+    if (identity && String(payload.ownerId || '') !== String(identity)) {
+        throw new Error('메모 소유자와 데이터파일 식별자가 일치하지 않습니다.');
+    }
+    if (type === 'index' && (!payload.aliases || typeof payload.aliases !== 'object' || !payload.owners || typeof payload.owners !== 'object')) {
+        throw new Error('챗시 노트 인덱스 구조가 손상되었습니다.');
+    }
+    if (type === 'owner' && (!payload.store || !Array.isArray(payload.store.notes)
+        || !payload.images || typeof payload.images !== 'object' || !Array.isArray(payload.migrations))) {
+        throw new Error('챗시 노트 소유자 데이터 구조가 손상되었습니다.');
+    }
+    const expected = await stmnSha256(stmnJsonForHash(payload));
+    if (!payload.payloadHash || payload.payloadHash !== expected) {
+        throw new Error('챗시 노트 데이터파일 무결성 검증에 실패했습니다.');
+    }
+    return payload;
+}
+
+function stmnFileUrl(fileName) {
+    return `/user/files/${encodeURIComponent(fileName)}`;
+}
+
+async function stmnReadJsonFile(fileName) {
+    const response = await fetch(`${stmnFileUrl(fileName)}?stmn=${Date.now()}-${Math.random()}`, {
+        method: 'GET',
+        cache: 'no-store',
+        credentials: 'same-origin',
+    });
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`${fileName}을(를) 읽지 못했습니다. (${response.status})`);
+    return response.json();
+}
+
+async function stmnReadFileBytes(fileName) {
+    const response = await fetch(`${stmnFileUrl(fileName)}?stmn=${Date.now()}-${Math.random()}`, {
+        method: 'GET',
+        cache: 'no-store',
+        credentials: 'same-origin',
+    });
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`${fileName}을(를) 읽지 못했습니다. (${response.status})`);
+    return new Uint8Array(await response.arrayBuffer());
+}
+
+async function stmnUploadBase64(fileName, data) {
+    if (!/^[a-zA-Z0-9_.-]+$/.test(fileName)) throw new Error('안전하지 않은 데이터파일 이름입니다.');
+    const response = await fetch('/api/files/upload', {
+        method: 'POST',
+        headers: stmnRequestHeaders(),
+        cache: 'no-cache',
+        body: JSON.stringify({ name: fileName, data }),
+    });
+    if (!response.ok) throw new Error(`${fileName}을(를) 저장하지 못했습니다. (${response.status})`);
+    return response.json();
+}
+
+async function stmnUploadJson(fileName, payload) {
+    const sealed = await stmnSealPayload(payload);
+    await stmnUploadBase64(fileName, stmnUtf8ToBase64(JSON.stringify(sealed)));
+    return sealed;
+}
+
+async function stmnVerifiedWriteJson(fileName, previousFileName, payload, validator) {
+    const existing = await stmnReadJsonFile(fileName);
+    if (existing && previousFileName) {
+        await stmnUploadBase64(previousFileName, stmnUtf8ToBase64(JSON.stringify(existing)));
+        const previous = await stmnReadJsonFile(previousFileName);
+        if (JSON.stringify(previous) !== JSON.stringify(existing)) {
+            throw new Error('이전 정상본 보존 검증에 실패했습니다.');
+        }
+    }
+    const sealed = await stmnUploadJson(fileName, payload);
+    const verified = await stmnReadJsonFile(fileName);
+    await validator(verified);
+    if (JSON.stringify(verified) !== JSON.stringify(sealed)) {
+        throw new Error('저장 후 재검증 결과가 일치하지 않습니다.');
+    }
+    return verified;
+}
+
+async function stmnRecoverJsonFromPrevious(fileName, previousFileName, validator) {
+    const previous = await stmnReadJsonFile(previousFileName);
+    if (!previous) return null;
+    await validator(previous);
+    await stmnUploadBase64(fileName, stmnUtf8ToBase64(JSON.stringify(previous)));
+    const restored = await stmnReadJsonFile(fileName);
+    await validator(restored);
+    if (JSON.stringify(restored) !== JSON.stringify(previous)) throw new Error('이전 정상본 복구 검증에 실패했습니다.');
+    globalThis.toastr?.warning?.('손상되거나 누락된 메모 파일을 직전 정상본으로 복구했습니다.');
+    return restored;
+}
+
+function stmnOwnerFileName(ownerId) {
+    return `${STMN_OWNER_FILE_PREFIX}${ownerId}.json`;
+}
+
+function stmnOwnerPreviousFileName(ownerId) {
+    return `${STMN_OWNER_FILE_PREFIX}${ownerId}.previous.json`;
+}
+
+function stmnClientId() {
+    stmnClientId.value ??= stmnId('client');
+    return stmnClientId.value;
+}
+
+function stmnCurrentScope() {
+    const context = stmnContext();
+    if (!context || !stmnHasChat()) return null;
+    const chatId = context.getCurrentChatId?.() ?? context.chatId ?? '';
+    if (context.groupId !== null && context.groupId !== undefined) {
+        const group = context.groups?.find(item => String(item.id) === String(context.groupId));
+        return {
+            kind: 'group',
+            label: group?.name || '그룹 채팅',
+            chatId: String(chatId),
+            aliases: [`group-id:${context.groupId}`],
+            metadata: context.chatMetadata,
+        };
+    }
+    const character = context.characters?.[context.characterId];
+    if (!character) return null;
+    const avatar = String(character.avatar || character.data?.avatar || '').trim();
+    const aliases = [];
+    if (avatar) aliases.push(`character-avatar:${avatar}`);
+    if (!aliases.length) aliases.push(`character-fallback:${context.characterId}:${character.name || context.name2 || ''}`);
+    return {
+        kind: 'character',
+        label: character.name || context.name2 || '캐릭터',
+        chatId: String(chatId),
+        aliases,
+        metadata: context.chatMetadata,
+    };
+}
+
+function stmnEmptyIndex() {
+    return {
+        app: 'ChatSSi MeMo',
+        schema: STMN_DATA_SCHEMA,
+        type: 'index',
+        revision: 0,
+        updatedAt: Date.now(),
+        aliases: {},
+        owners: {},
+    };
+}
+
+function stmnEmptyOwner(ownerId, scope) {
+    return {
+        app: 'ChatSSi MeMo',
+        schema: STMN_DATA_SCHEMA,
+        type: 'owner',
+        ownerId,
+        revision: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        scope: { kind: scope.kind, label: scope.label },
+        store: { version: STMN_VERSION, notes: [], selectedId: null },
+        images: {},
+        migrations: [],
+        lease: null,
+    };
+}
+
+async function stmnReadIndex() {
+    let index = null;
+    try {
+        index = await stmnReadJsonFile(STMN_INDEX_FILE);
+        if (index) await stmnValidatePayload(index, 'index');
+    } catch (error) {
+        console.error('[ChatSSi MeMo] Index validation failed; trying previous copy', error);
+        index = await stmnRecoverJsonFromPrevious(STMN_INDEX_FILE, STMN_INDEX_PREVIOUS_FILE, value => stmnValidatePayload(value, 'index'));
+        if (!index) throw error;
+    }
+    if (!index) {
+        index = await stmnRecoverJsonFromPrevious(STMN_INDEX_FILE, STMN_INDEX_PREVIOUS_FILE, value => stmnValidatePayload(value, 'index'));
+        if (!index) return stmnEmptyIndex();
+    }
+    index.aliases = index.aliases && typeof index.aliases === 'object' ? index.aliases : {};
+    index.owners = index.owners && typeof index.owners === 'object' ? index.owners : {};
+    return index;
+}
+
+async function stmnWriteIndex(index) {
+    const next = structuredClone(index);
+    next.revision = Number(next.revision || 0) + 1;
+    next.updatedAt = Date.now();
+    return stmnVerifiedWriteJson(STMN_INDEX_FILE, STMN_INDEX_PREVIOUS_FILE, next, value => stmnValidatePayload(value, 'index'));
+}
+
+function stmnQueueIndex(operation) {
+    const next = stmnIndexWriteQueue.catch(() => {}).then(operation);
+    stmnIndexWriteQueue = next.catch(() => {});
+    return next;
+}
+
+function stmnQueueOwner(ownerId, operation) {
+    const previous = stmnOwnerWriteQueues.get(ownerId) || Promise.resolve();
+    const next = previous.catch(() => {}).then(operation);
+    stmnOwnerWriteQueues.set(ownerId, next.catch(() => {}));
+    return next;
+}
+
+async function stmnResolveOwner(scope) {
+    return stmnQueueIndex(async () => {
+        let index = await stmnReadIndex();
+        let ownerId = scope.aliases.map(alias => index.aliases[alias]).find(Boolean) || null;
+        let changed = false;
+        if (!ownerId) {
+            ownerId = crypto.randomUUID?.() || stmnId('owner').replace(/^owner-/, '');
+            index.owners[ownerId] = {
+                ownerId,
+                kind: scope.kind,
+                label: scope.label,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                aliases: [],
+            };
+            changed = true;
+        }
+        const owner = index.owners[ownerId] ??= {
+            ownerId,
+            kind: scope.kind,
+            label: scope.label,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            aliases: [],
+        };
+        if (owner.label !== scope.label) changed = true;
+        owner.label = scope.label;
+        owner.updatedAt = Date.now();
+        owner.aliases = Array.isArray(owner.aliases) ? owner.aliases : [];
+        for (const alias of scope.aliases) {
+            if (index.aliases[alias] !== ownerId) {
+                index.aliases[alias] = ownerId;
+                changed = true;
+            }
+            if (!owner.aliases.includes(alias)) {
+                owner.aliases.push(alias);
+                changed = true;
+            }
+        }
+        if (changed) {
+            index = await stmnWriteIndex(index);
+            const winner = scope.aliases.map(alias => index.aliases[alias]).find(Boolean);
+            if (winner) ownerId = winner;
+        }
+        const fileName = stmnOwnerFileName(ownerId);
+        let payload = null;
+        try {
+            payload = await stmnReadJsonFile(fileName);
+            if (payload) await stmnValidatePayload(payload, 'owner', ownerId);
+        } catch (error) {
+            console.error('[ChatSSi MeMo] Owner validation failed; trying previous copy', error);
+            payload = await stmnRecoverJsonFromPrevious(
+                fileName,
+                stmnOwnerPreviousFileName(ownerId),
+                value => stmnValidatePayload(value, 'owner', ownerId),
+            );
+            if (!payload) throw error;
+        }
+        if (!payload) {
+            payload = await stmnRecoverJsonFromPrevious(
+                fileName,
+                stmnOwnerPreviousFileName(ownerId),
+                value => stmnValidatePayload(value, 'owner', ownerId),
+            ) || await stmnVerifiedWriteJson(
+                    fileName,
+                    stmnOwnerPreviousFileName(ownerId),
+                    stmnEmptyOwner(ownerId, scope),
+                    value => stmnValidatePayload(value, 'owner', ownerId),
+                );
+        }
+        payload.store = stmnNormalizeStoreObject(payload.store);
+        payload.images = payload.images && typeof payload.images === 'object' ? payload.images : {};
+        payload.migrations = Array.isArray(payload.migrations) ? payload.migrations : [];
+        return { index, ownerId, fileName, payload };
+    });
+}
+
+function stmnLeaseIsForeign(payload) {
+    const lease = payload?.lease;
+    return Boolean(lease?.clientId && lease.clientId !== stmnClientId() && Number(lease.expiresAt) > Date.now());
+}
+
+function stmnNoteContentKey(note) {
+    return JSON.stringify({
+        title: note.title || '',
+        contentHtml: note.contentHtml || '',
+        heightMode: note.heightMode || 'auto',
+        height: note.height || null,
+    });
+}
+
+function stmnMergeStores(baseInput, incomingInput, source = '') {
+    const base = stmnNormalizeStoreObject(structuredClone(baseInput));
+    const incoming = stmnNormalizeStoreObject(structuredClone(incomingInput));
+    const byId = new Map(base.notes.map(note => [note.id, note]));
+    const byContent = new Set(base.notes.map(stmnNoteContentKey));
+    let added = 0;
+    let conflicts = 0;
+    for (const candidate of incoming.notes) {
+        const sameId = byId.get(candidate.id);
+        const key = stmnNoteContentKey(candidate);
+        if (sameId && stmnNoteContentKey(sameId) === key) continue;
+        if (!sameId && byContent.has(key)) continue;
+        const note = structuredClone(candidate);
+        if (sameId) {
+            note.id = stmnId('note');
+            note.title = `${note.title || '메모'} (이관 충돌본)`;
+            conflicts += 1;
+        }
+        if (source) note.migrationSource = source;
+        base.notes.push(note);
+        byId.set(note.id, note);
+        byContent.add(stmnNoteContentKey(note));
+        added += 1;
+    }
+    if (!base.selectedId && incoming.selectedId && byId.has(incoming.selectedId)) base.selectedId = incoming.selectedId;
+    if (!base.notes.some(note => note.id === base.selectedId)) base.selectedId = base.notes[0]?.id || null;
+    return { store: base, added, conflicts };
+}
+
+function stmnReconcileStoreInPlace(targetInput, sourceInput, preserveLocal = false, savedInput = null) {
+    const target = stmnNormalizeStoreObject(targetInput);
+    const source = stmnNormalizeStoreObject(structuredClone(sourceInput));
+    const existingById = new Map(target.notes.map(note => [note.id, note]));
+
+    if (preserveLocal) {
+        const savedIds = new Set((savedInput?.notes || []).map(note => note.id));
+        for (const sourceNote of source.notes) {
+            if (!existingById.has(sourceNote.id) && !savedIds.has(sourceNote.id)) {
+                target.notes.push(sourceNote);
+                existingById.set(sourceNote.id, sourceNote);
+            }
+        }
+        if (!target.notes.some(note => note.id === target.selectedId)) {
+            target.selectedId = target.notes[0]?.id ?? null;
+        }
+        target.version = STMN_VERSION;
+        return target;
+    }
+
+    const nextNotes = source.notes.map(sourceNote => {
+        const existing = existingById.get(sourceNote.id);
+        if (!existing) return sourceNote;
+        for (const key of Object.keys(existing)) {
+            if (!(key in sourceNote)) delete existing[key];
+        }
+        Object.assign(existing, sourceNote);
+        return existing;
+    });
+    target.notes.splice(0, target.notes.length, ...nextNotes);
+    target.selectedId = source.selectedId;
+    target.version = STMN_VERSION;
+    return target;
+}
+
+function stmnReconcileObjectInPlace(target, source, preserveLocal = false) {
+    const destination = target && typeof target === 'object' && !Array.isArray(target) ? target : {};
+    if (preserveLocal) {
+        for (const [key, value] of Object.entries(source && typeof source === 'object' ? source : {})) {
+            if (!(key in destination)) destination[key] = structuredClone(value);
+        }
+    } else {
+        for (const key of Object.keys(destination)) delete destination[key];
+        Object.assign(destination, structuredClone(source && typeof source === 'object' ? source : {}));
+    }
+    return destination;
+}
+
+function stmnApplyVerifiedOwnerPayload(runtime, verified, preserveLocal = false, savedStore = null) {
+    const payload = runtime.payload;
+    const liveStore = payload.store;
+    const liveImages = payload.images && typeof payload.images === 'object' ? payload.images : {};
+    const liveMigrations = Array.isArray(payload.migrations) ? payload.migrations : [];
+
+    stmnReconcileStoreInPlace(liveStore, verified.store, preserveLocal, savedStore);
+    stmnReconcileObjectInPlace(liveImages, verified.images, preserveLocal);
+    if (!preserveLocal) {
+        liveMigrations.splice(0, liveMigrations.length, ...structuredClone(verified.migrations || []));
+    } else {
+        const known = new Set(liveMigrations.map(item => `${item.sourceChatId || ''}:${item.sourceHash || ''}`));
+        for (const item of verified.migrations || []) {
+            const key = `${item.sourceChatId || ''}:${item.sourceHash || ''}`;
+            if (!known.has(key)) liveMigrations.push(structuredClone(item));
+        }
+    }
+
+    for (const [key, value] of Object.entries(verified)) {
+        if (key === 'store' || key === 'images' || key === 'migrations') continue;
+        payload[key] = structuredClone(value);
+    }
+    payload.store = liveStore;
+    payload.images = liveImages;
+    payload.migrations = liveMigrations;
+    return payload;
+}
+
+async function stmnWriteOwner(runtime, snapshot = runtime.payload.store, options = {}) {
+    const localStore = structuredClone(snapshot);
+    const liveStore = runtime.payload.store;
+    const liveImages = runtime.payload.images;
+    const liveMigrations = runtime.payload.migrations;
+    const changeVersionAtStart = Number(runtime.changeVersion || 0);
+    return stmnQueueOwner(runtime.ownerId, async () => {
+        const current = await stmnReadJsonFile(runtime.fileName);
+        if (!current) throw new Error('메모 데이터파일이 사라졌습니다. 저장을 중단했습니다.');
+        await stmnValidatePayload(current, 'owner', runtime.ownerId);
+        if (stmnLeaseIsForeign(current)) {
+            const error = new Error('다른 기기나 탭에서 이 메모를 편집 중입니다. 현재 창은 읽기 전용으로 전환됩니다.');
+            error.code = 'STMN_LEASE_CONFLICT';
+            throw error;
+        }
+        let store = localStore;
+        if (Number(current.revision) !== Number(runtime.payload.revision) && current.lease?.clientId !== stmnClientId()) {
+            store = stmnMergeStores(current.store, localStore, 'concurrent-merge').store;
+        }
+        const leaseToken = current.lease?.clientId === stmnClientId()
+            ? current.lease.token
+            : stmnId('lease');
+        const next = {
+            ...current,
+            revision: Number(current.revision || 0) + 1,
+            updatedAt: Date.now(),
+            scope: structuredClone(runtime.payload.scope),
+            store,
+            images: { ...(current.images || {}), ...(runtime.payload.images || {}) },
+            migrations: Array.isArray(options.migrations) ? options.migrations : (runtime.payload.migrations || current.migrations || []),
+            lease: {
+                clientId: stmnClientId(),
+                token: leaseToken,
+                expiresAt: Date.now() + STMN_LEASE_MS,
+            },
+        };
+        const verified = await stmnVerifiedWriteJson(
+            runtime.fileName,
+            stmnOwnerPreviousFileName(runtime.ownerId),
+            next,
+            value => stmnValidatePayload(value, 'owner', runtime.ownerId),
+        );
+        const changedWhileSaving = Number(runtime.changeVersion || 0) !== changeVersionAtStart
+            || JSON.stringify(liveStore) !== JSON.stringify(localStore);
+        stmnApplyVerifiedOwnerPayload(runtime, verified, changedWhileSaving, localStore);
+        if (changedWhileSaving) {
+            runtime.dirty = true;
+        }
+        runtime.readOnly = false;
+        stmnScheduleLeaseRenewal();
+        return verified;
+    });
+}
+
+function stmnScheduleLeaseRenewal() {
+    if (stmnLeaseTimer) clearTimeout(stmnLeaseTimer);
+    const runtime = stmnStorageRuntime;
+    if (!runtime?.payload?.lease || runtime.payload.lease.clientId !== stmnClientId()) return;
+    stmnLeaseTimer = setTimeout(() => {
+        stmnLeaseTimer = null;
+        if (runtime === stmnStorageRuntime && runtime.status === 'ready') {
+            stmnWriteOwner(runtime, runtime.payload.store).catch(error => stmnHandleSaveError(runtime, error));
+        }
+    }, STMN_LEASE_RENEW_MS);
+}
+
+async function stmnTakeEditingLease() {
+    const runtime = stmnStorageRuntime;
+    if (!runtime || runtime.status !== 'ready' || !runtime.readOnly) return;
+    if (!globalThis.confirm('다른 기기나 탭의 편집을 중단시키고 이 창에서 편집권을 가져올까요? 다른 곳의 아직 저장되지 않은 입력은 보존되지 않을 수 있습니다.')) return;
+    try {
+        const verified = await stmnQueueOwner(runtime.ownerId, async () => {
+            const current = await stmnReadJsonFile(runtime.fileName);
+            await stmnValidatePayload(current, 'owner', runtime.ownerId);
+            const next = {
+                ...current,
+                revision: Number(current.revision || 0) + 1,
+                updatedAt: Date.now(),
+                lease: { clientId: stmnClientId(), token: stmnId('lease'), expiresAt: Date.now() + STMN_LEASE_MS },
+            };
+            return stmnVerifiedWriteJson(
+                runtime.fileName,
+                stmnOwnerPreviousFileName(runtime.ownerId),
+                next,
+                value => stmnValidatePayload(value, 'owner', runtime.ownerId),
+            );
+        });
+        stmnApplyVerifiedOwnerPayload(runtime, verified, false);
+        runtime.readOnly = false;
+        runtime.dirty = false;
+        stmnScheduleLeaseRenewal();
+        stmnRenderNotes({ flush: false });
+        globalThis.toastr?.success?.('이 창으로 메모 편집권을 가져왔습니다.');
+    } catch (error) {
+        console.error('[ChatSSi MeMo] Failed to take editing lease', error);
+        globalThis.toastr?.error?.(error.message || '편집권을 가져오지 못했습니다.');
+    }
+}
+
+function stmnDownloadBlob(name, blob) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = name;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function stmnPreserveConflictCopy(runtime) {
+    try {
+        const payload = {
+            app: 'ChatSSi MeMo',
+            schema: STMN_BACKUP_SCHEMA,
+            type: 'conflict-copy',
+            createdAt: new Date().toISOString(),
+            ownerId: runtime.ownerId,
+            label: runtime.scope.label,
+            store: structuredClone(runtime.payload.store),
+        };
+        const sealed = await stmnSealBackup(payload);
+        stmnDownloadBlob(`ChatSSi-MeMo_CONFLICT_${stmnTimestamp()}.backup.json`, new Blob([JSON.stringify(sealed, null, 2)], { type: 'application/json' }));
+    } catch (error) {
+        console.error('[ChatSSi MeMo] Failed to preserve conflict copy', error);
+    }
+}
+
+async function stmnHandleSaveError(runtime, error) {
+    console.error('[ChatSSi MeMo] Failed to save memo data', error);
+    if (error?.code === 'STMN_LEASE_CONFLICT') {
+        runtime.readOnly = true;
+        await stmnPreserveConflictCopy(runtime);
+        if (runtime === stmnStorageRuntime) stmnRenderNotes();
+    } else if (runtime === stmnStorageRuntime) {
+        setTimeout(() => {
+            if (runtime === stmnStorageRuntime && runtime.dirty) void stmnSaveNow(runtime);
+        }, 2500);
+    }
+    globalThis.toastr?.error?.(error?.message || '메모 저장에 실패했습니다.');
+}
+
+async function stmnSaveNow(runtime = stmnStorageRuntime) {
+    if (stmnSaveTimer && runtime === stmnStorageRuntime) {
+        clearTimeout(stmnSaveTimer);
+        stmnSaveTimer = null;
+    }
+    if (!runtime || runtime.status !== 'ready' || runtime.readOnly || !runtime.dirty) return;
+    if (runtime.savePromise) return runtime.savePromise;
+    const snapshot = structuredClone(runtime.payload.store);
+    const changeVersionAtStart = Number(runtime.changeVersion || 0);
+    runtime.dirty = false;
+    runtime.savePromise = (async () => {
+        try {
+            await stmnWriteOwner(runtime, snapshot);
+            if (Number(runtime.changeVersion || 0) !== changeVersionAtStart) runtime.dirty = true;
+            if (runtime === stmnStorageRuntime && !runtime.dirty) {
+                document.querySelector('#stmn-save-state')?.classList.remove('is-saving');
+            }
+        } catch (error) {
+            runtime.dirty = true;
+            await stmnHandleSaveError(runtime, error);
+        }
+    })();
+    try {
+        await runtime.savePromise;
+    } finally {
+        runtime.savePromise = null;
+    }
+    if (runtime.dirty && !runtime.readOnly) {
+        if (runtime === stmnStorageRuntime) stmnScheduleSave(0, false);
+        else void stmnSaveNow(runtime);
+    }
+}
+
+function stmnScheduleSave(delay = 450, markChange = true) {
+    const runtimeAtSchedule = stmnStorageRuntime;
+    if (!runtimeAtSchedule || runtimeAtSchedule.status !== 'ready' || runtimeAtSchedule.readOnly) return;
+    if (markChange) stmnMarkRuntimeDirty(runtimeAtSchedule);
+    else {
+        runtimeAtSchedule.dirty = true;
+        document.querySelector('#stmn-save-state')?.classList.add('is-saving');
+    }
+    if (stmnSaveTimer) clearTimeout(stmnSaveTimer);
+    stmnSaveTimer = setTimeout(async () => {
+        stmnSaveTimer = null;
+        await stmnSaveNow(runtimeAtSchedule);
+    }, delay);
+}
+
+function stmnParseDataUrl(dataUrl) {
+    const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i.exec(String(dataUrl || ''));
+    if (!match) throw new Error('이미지 데이터 형식이 올바르지 않습니다.');
+    return { mimeType: match[1].toLowerCase(), bytes: stmnBase64ToBytes(match[2]) };
+}
+
+function stmnImageExtension(mimeType) {
+    if (mimeType === 'image/webp') return 'webp';
+    if (mimeType === 'image/jpeg') return 'jpg';
+    if (mimeType === 'image/png') return 'png';
+    if (mimeType === 'image/gif') return 'gif';
+    return 'img';
+}
+
+async function stmnStoreImageFile(runtime, dataUrl, name = '이미지') {
+    const parsed = stmnParseDataUrl(dataUrl);
+    const sha256 = await stmnSha256(parsed.bytes);
+    const existing = Object.values(runtime.payload.images || {}).find(image => image.sha256 === sha256);
+    if (existing) return existing;
+    const imageId = crypto.randomUUID?.() || stmnId('image').replace(/^image-/, '');
+    const fileName = `${STMN_IMAGE_FILE_PREFIX}${runtime.ownerId}_${imageId}.${stmnImageExtension(parsed.mimeType)}`;
+    await stmnUploadBase64(fileName, stmnBytesToBase64(parsed.bytes));
+    const verifiedBytes = await stmnReadFileBytes(fileName);
+    if (!verifiedBytes || await stmnSha256(verifiedBytes) !== sha256) {
+        throw new Error('분리 저장한 이미지의 무결성 검증에 실패했습니다.');
+    }
+    const image = {
+        id: imageId,
+        fileName,
+        mimeType: parsed.mimeType,
+        sha256,
+        size: parsed.bytes.byteLength,
+        name: String(name || '이미지').slice(0, 240),
+        createdAt: Date.now(),
+    };
+    runtime.payload.images[imageId] = image;
+    return image;
+}
+
+async function stmnExternalizeStoreImages(runtime, inputStore) {
+    const store = stmnNormalizeStoreObject(structuredClone(inputStore));
+    for (const note of store.notes) {
+        const holder = document.createElement('div');
+        holder.innerHTML = stmnSanitizeEditorHtml(note.contentHtml);
+        for (const wrapper of holder.querySelectorAll('[data-stmn-image]')) {
+            const imageElement = wrapper.querySelector('img');
+            const source = imageElement?.getAttribute('src') || '';
+            if (!source.startsWith('data:image/')) continue;
+            const image = await stmnStoreImageFile(runtime, source, wrapper.dataset.name || imageElement.alt || '이미지');
+            wrapper.dataset.stmnImageId = image.id;
+            imageElement.setAttribute('src', stmnFileUrl(image.fileName));
+        }
+        note.contentHtml = stmnNormalizeEditorHtml(holder.innerHTML);
+    }
+    return store;
+}
+
+async function stmnMigrateLegacyMetadata(runtime, scope) {
+    const legacyRaw = scope.metadata?.[STMN_CHAT_KEY];
+    if (!legacyRaw || typeof legacyRaw !== 'object' || !Array.isArray(legacyRaw.notes) || !legacyRaw.notes.length) return;
+    const sourceHash = await stmnSha256(JSON.stringify(legacyRaw));
+    const sourceStore = stmnNormalizeStoreObject(structuredClone(legacyRaw));
+    const sourceChatId = scope.chatId || '(unknown-chat)';
+    if (runtime.payload.migrations.some(item => item.sourceChatId === sourceChatId && item.sourceHash === sourceHash)) return;
+    try {
+        const externalized = await stmnExternalizeStoreImages(runtime, sourceStore);
+        const merged = stmnMergeStores(runtime.payload.store, externalized, sourceChatId);
+        const migrations = [...runtime.payload.migrations, {
+            sourceChatId,
+            sourceHash,
+            copiedAt: Date.now(),
+            notesFound: sourceStore.notes.length,
+            notesAdded: merged.added,
+            conflictsPreserved: merged.conflicts,
+        }];
+        stmnReconcileStoreInPlace(runtime.payload.store, merged.store, false);
+        runtime.payload.migrations.splice(0, runtime.payload.migrations.length, ...migrations);
+        await stmnWriteOwner(runtime, runtime.payload.store, { migrations: runtime.payload.migrations });
+        globalThis.toastr?.success?.(`기존 채팅 메모를 안전하게 복사했습니다. (${merged.added}개 추가)`);
+    } catch (error) {
+        console.error('[ChatSSi MeMo] Legacy copy migration failed', error);
+        globalThis.toastr?.error?.(`${error.message || '기존 메모 복사에 실패했습니다.'} 채팅 원본은 변경하지 않았습니다.`);
+    }
+}
+
+function stmnResetViewState() {
+    if (stmnFindRefreshTimer) clearTimeout(stmnFindRefreshTimer);
+    stmnFindRefreshTimer = null;
+    stmnClearFindVisuals(true);
+    stmnSearch = '';
+    stmnFindMatches = [];
+    stmnFindIndex = -1;
+    const search = document.querySelector('#stmn-search');
+    if (search) search.value = '';
+    stmnEditorRanges.clear();
+    stmnSelectedRanges.clear();
+    stmnPendingImageRanges.clear();
+    stmnSelectedImages.clear();
+}
+
+async function stmnLoadCurrentStorage(scope = stmnCurrentScope()) {
+    const previousRuntime = stmnStorageRuntime;
+    if (previousRuntime?.status === 'ready') {
+        stmnFlushVisibleEditors(previousRuntime, { schedule: false });
+    }
+    const token = ++stmnStorageLoadToken;
     if (stmnSaveTimer) {
         clearTimeout(stmnSaveTimer);
         stmnSaveTimer = null;
     }
-    const context = stmnContext();
-    if (!context || !stmnHasChat()) return;
+    if (stmnLeaseTimer) {
+        clearTimeout(stmnLeaseTimer);
+        stmnLeaseTimer = null;
+    }
+    stmnStorageRuntime = scope ? { status: 'loading', scope } : null;
+    stmnResetViewState();
+    stmnRenderNotes();
+    if (previousRuntime?.status === 'ready' && !previousRuntime.readOnly && previousRuntime.dirty) {
+        await stmnSaveNow(previousRuntime);
+        if (token !== stmnStorageLoadToken) return null;
+        if (previousRuntime.dirty && !previousRuntime.readOnly) {
+            await stmnPreserveConflictCopy(previousRuntime);
+            setTimeout(() => { if (previousRuntime.dirty) void stmnSaveNow(previousRuntime); }, 2500);
+        }
+        if (stmnLeaseTimer) {
+            clearTimeout(stmnLeaseTimer);
+            stmnLeaseTimer = null;
+        }
+    }
+    if (!scope) return null;
     try {
-        await context.saveMetadata();
-        document.querySelector('#stmn-save-state')?.classList.remove('is-saving');
+        const resolved = await stmnResolveOwner(scope);
+        if (token !== stmnStorageLoadToken) return null;
+        const runtime = {
+            status: 'ready',
+            scope,
+            index: resolved.index,
+            ownerId: resolved.ownerId,
+            fileName: resolved.fileName,
+            payload: resolved.payload,
+            readOnly: stmnLeaseIsForeign(resolved.payload),
+            dirty: false,
+            changeVersion: 0,
+            savePromise: null,
+        };
+        stmnStorageRuntime = runtime;
+        stmnRenderNotes();
+        if (!runtime.readOnly) await stmnMigrateLegacyMetadata(runtime, scope);
+        if (token === stmnStorageLoadToken && stmnStorageRuntime === runtime) stmnRenderNotes();
+        return runtime;
     } catch (error) {
-        console.error('[ChatSSi MeMo] Failed to save chat metadata', error);
-        globalThis.toastr?.error?.('메모 저장에 실패했습니다.');
+        if (token !== stmnStorageLoadToken) return null;
+        stmnStorageRuntime = { status: 'error', scope, error };
+        console.error('[ChatSSi MeMo] Failed to load shared storage', error);
+        stmnRenderNotes();
+        globalThis.toastr?.error?.(error.message || '메모 데이터파일을 불러오지 못했습니다.');
+        return null;
     }
 }
 
-function stmnScheduleSave(delay = 450) {
-    const metadataAtSchedule = stmnCurrentMetadata();
-    document.querySelector('#stmn-save-state')?.classList.add('is-saving');
-    if (stmnSaveTimer) clearTimeout(stmnSaveTimer);
-    stmnSaveTimer = setTimeout(async () => {
-        stmnSaveTimer = null;
-        if (metadataAtSchedule !== stmnCurrentMetadata()) return;
-        await stmnSaveNow();
-    }, delay);
+async function stmnHandleCharacterRenamed(oldAvatar, newAvatar) {
+    const runtime = stmnStorageRuntime;
+    const scope = stmnCurrentScope();
+    if (scope?.kind === 'character' && typeof newAvatar === 'string' && newAvatar.trim()) {
+        scope.aliases = [`character-avatar:${newAvatar.trim()}`];
+    }
+    if (runtime?.scope?.kind === 'character' && typeof oldAvatar === 'string' && oldAvatar.trim()) {
+        runtime.scope.aliases = [`character-avatar:${oldAvatar.trim()}`];
+    }
+    if (!runtime || runtime.status !== 'ready' || runtime.scope.kind !== 'character' || scope?.kind !== 'character') {
+        await stmnLoadCurrentStorage(scope);
+        return;
+    }
+    try {
+        const updatedIndex = await stmnQueueIndex(async () => {
+            let index = await stmnReadIndex();
+            const owner = index.owners[runtime.ownerId];
+            if (!owner) return index;
+            const oldAliases = new Set(runtime.scope.aliases || []);
+            for (const alias of oldAliases) {
+                if (index.aliases[alias] === runtime.ownerId && !scope.aliases.includes(alias)) delete index.aliases[alias];
+            }
+            for (const alias of scope.aliases) index.aliases[alias] = runtime.ownerId;
+            owner.aliases = (owner.aliases || []).filter(alias => !oldAliases.has(alias) || scope.aliases.includes(alias));
+            for (const alias of scope.aliases) if (!owner.aliases.includes(alias)) owner.aliases.push(alias);
+            owner.label = scope.label;
+            owner.updatedAt = Date.now();
+            index = await stmnWriteIndex(index);
+            return index;
+        });
+        runtime.index = updatedIndex;
+        runtime.scope = scope;
+        runtime.payload.scope = { kind: scope.kind, label: scope.label };
+        stmnMarkRuntimeDirty(runtime);
+        await stmnSaveNow(runtime);
+        stmnRenderNotes();
+    } catch (error) {
+        console.error('[ChatSSi MeMo] Character rename alias update failed', error);
+        globalThis.toastr?.error?.('캐릭터 이름 변경에 맞춰 메모 연결을 갱신하지 못했습니다.');
+    }
 }
 
 function stmnSanitize(html) {
@@ -787,7 +1719,7 @@ function stmnSanitizeEditorHtml(html) {
     if (!purifier) return String(html ?? '').replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '');
     return purifier.sanitize(String(html ?? ''), {
         ALLOWED_TAGS: ['div', 'p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'span', 'mark', 'font', 'img', 'button'],
-        ALLOWED_ATTR: ['style', 'size', 'class', 'data-stmn-line', 'data-stmn-text-size', 'data-checked', 'data-stmn-image', 'data-name', 'data-caption', 'data-remove-image', 'data-placeholder', 'contenteditable', 'tabindex', 'role', 'aria-checked', 'aria-label', 'title', 'src', 'alt', 'draggable', 'type'],
+        ALLOWED_ATTR: ['style', 'size', 'class', 'data-stmn-line', 'data-stmn-text-size', 'data-checked', 'data-stmn-image', 'data-stmn-image-id', 'data-name', 'data-caption', 'data-remove-image', 'data-placeholder', 'contenteditable', 'tabindex', 'role', 'aria-checked', 'aria-label', 'title', 'src', 'alt', 'draggable', 'type'],
         ALLOW_DATA_ATTR: true,
         ADD_DATA_URI_TAGS: ['img'],
     });
@@ -855,6 +1787,10 @@ function stmnChatLabel() {
 }
 
 function stmnCreateNote({ title = '', html = '', checklistText = '' } = {}) {
+    if (stmnStorageRuntime?.readOnly) {
+        globalThis.toastr?.warning?.('다른 기기나 탭에서 편집 중이라 현재 창은 읽기 전용입니다.');
+        return null;
+    }
     const store = stmnStore();
     if (!store) {
         globalThis.toastr?.warning?.('먼저 캐릭터나 그룹 채팅을 열어주세요.');
@@ -884,6 +1820,7 @@ function stmnSelectNote(id) {
 }
 
 function stmnDeleteNote(id) {
+    if (stmnStorageRuntime?.readOnly) return;
     const store = stmnStore(false);
     const note = stmnGetNote(id);
     if (!store || !note) return;
@@ -895,6 +1832,7 @@ function stmnDeleteNote(id) {
 }
 
 function stmnMoveNote(id, delta) {
+    if (stmnStorageRuntime?.readOnly) return;
     const store = stmnStore(false);
     if (!store) return;
     const index = store.notes.findIndex(note => note.id === id);
@@ -1099,8 +2037,9 @@ function stmnScheduleFindRefresh() {
 }
 
 function stmnCardTemplate(note, index, total) {
+    const readOnly = Boolean(stmnStorageRuntime?.readOnly);
     const card = document.createElement('article');
-    card.className = `stmn-card${note.collapsed ? ' is-collapsed' : ''}`;
+    card.className = `stmn-card${note.collapsed ? ' is-collapsed' : ''}${readOnly ? ' is-read-only' : ''}`;
     card.dataset.stmnNoteId = note.id;
     if (note.heightMode === 'manual' && !note.collapsed) {
         card.classList.add('is-manual-height');
@@ -1138,13 +2077,18 @@ function stmnCardTemplate(note, index, total) {
             ${STMN_HIGHLIGHTS.map(color => `<button type="button" class="stmn-highlight" data-highlight="${color}" style="--stmn-highlight:${color}" title="선택한 글자 강조 · 같은 색을 다시 누르면 지우기"></button>`).join('')}
             <button type="button" class="stmn-highlight-clear" data-highlight="transparent" title="형광펜 지우기">지우기</button>
         </div>
-        <div class="stmn-card-main"><div class="stmn-unified-editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="메모 내용을 입력하세요"></div></div>
+        <div class="stmn-card-main"><div class="stmn-unified-editor" contenteditable="${readOnly ? 'false' : 'true'}" role="textbox" aria-multiline="true" data-placeholder="메모 내용을 입력하세요"></div></div>
         <div class="stmn-overflow-mark" aria-hidden="true">…</div>
         <div class="stmn-card-resizer" title="위아래로 드래그해 메모 높이 조절"></div>
         <input class="stmn-image-input" type="file" accept="image/*" hidden>
     `;
     card.querySelector('.stmn-title-input').value = note.title;
     card.querySelector('.stmn-unified-editor').innerHTML = stmnNormalizeEditorHtml(note.contentHtml);
+    if (readOnly) {
+        card.querySelector('.stmn-title-input').readOnly = true;
+        card.querySelectorAll('button, select, .stmn-image-input').forEach(control => { control.disabled = true; });
+        card.querySelectorAll('[contenteditable="true"]').forEach(element => { element.contentEditable = 'false'; });
+    }
     stmnBindCard(card, note);
     return card;
 }
@@ -1406,6 +2350,42 @@ function stmnEditorHtmlForStorage(editor, normalize = false) {
     return normalize ? stmnNormalizeEditorHtml(clean.innerHTML) : stmnSanitizeEditorHtml(clean.innerHTML);
 }
 
+function stmnCancelCompositionSync(editor) {
+    if (!editor) return;
+    if (editor.__stmnCompositionSyncTimer !== null && editor.__stmnCompositionSyncTimer !== undefined) {
+        clearTimeout(editor.__stmnCompositionSyncTimer);
+    }
+    editor.__stmnCompositionSyncTimer = null;
+    stmnComposingEditors.delete(editor);
+    stmnSettlingEditors.delete(editor);
+}
+
+function stmnFlushVisibleEditors(runtime = stmnStorageRuntime, { schedule = true } = {}) {
+    if (!runtime || runtime.status !== 'ready' || runtime.readOnly) return false;
+    const list = document.querySelector('#stmn-notes');
+    if (!list || (list.dataset.stmnOwnerId && list.dataset.stmnOwnerId !== runtime.ownerId)) return false;
+    let changed = false;
+    for (const card of list.querySelectorAll('[data-stmn-note-id]')) {
+        const note = runtime.payload.store.notes.find(item => item.id === card.dataset.stmnNoteId);
+        if (!note) continue;
+        const title = card.querySelector('.stmn-title-input');
+        const editor = card.querySelector('.stmn-unified-editor');
+        if (editor) stmnCancelCompositionSync(editor);
+        const nextTitle = title?.value ?? note.title;
+        const nextHtml = editor ? stmnEditorHtmlForStorage(editor, true) : note.contentHtml;
+        if (note.title === nextTitle && note.contentHtml === nextHtml) continue;
+        note.title = nextTitle;
+        note.contentHtml = nextHtml;
+        note.updatedAt = Date.now();
+        changed = true;
+    }
+    if (changed) {
+        stmnMarkRuntimeDirty(runtime);
+        if (schedule && runtime === stmnStorageRuntime) stmnScheduleSave(0, false);
+    }
+    return changed;
+}
+
 function stmnLineContent(line) {
     return line.dataset.stmnLine === 'check' ? line.querySelector(':scope > .stmn-check-content') : line;
 }
@@ -1469,6 +2449,7 @@ function stmnToggleChecklist(note, editor, text = null) {
 }
 
 function stmnAppendChecklist(note, text = '') {
+    if (stmnStorageRuntime?.readOnly) return;
     const editor = stmnEditorFor(note.id);
     if (!editor) {
         note.contentHtml = `${note.contentHtml}${stmnCheckLineMarkup(stmnEscapeHtml(text))}`;
@@ -1586,21 +2567,22 @@ function stmnBindCard(card, note) {
         stmnScheduleSave();
         stmnScheduleFindRefresh();
     });
-    card.querySelector('.stmn-title-input').addEventListener('blur', stmnSaveNow);
+    card.querySelector('.stmn-title-input').addEventListener('blur', () => { void stmnSaveNow(); });
 
     editor.addEventListener('focus', () => {
         card.classList.add('is-editing');
         stmnUpdateFormatControls(card, editor);
     });
-    let compositionSyncTimer = null;
     editor.addEventListener('blur', async event => {
-        if (compositionSyncTimer !== null) clearTimeout(compositionSyncTimer);
-        compositionSyncTimer = null;
-        stmnComposingEditors.delete(editor);
-        stmnSettlingEditors.delete(editor);
+        stmnCancelCompositionSync(editor);
         card.classList.remove('is-editing');
         if (!event.relatedTarget?.closest?.('[data-format-size]')) stmnCleanupTextSizeTypingMarkers(editor, true);
-        note.contentHtml = stmnEditorHtmlForStorage(editor, true);
+        const nextHtml = stmnEditorHtmlForStorage(editor, true);
+        if (note.contentHtml !== nextHtml) {
+            note.contentHtml = nextHtml;
+            note.updatedAt = Date.now();
+            stmnScheduleSave(0);
+        }
         await stmnSaveNow();
         stmnUpdateOverflow(card);
     });
@@ -1620,16 +2602,20 @@ function stmnBindCard(card, note) {
     };
     const scheduleCompositionSync = event => {
         const target = event.target || editor;
-        if (compositionSyncTimer !== null) clearTimeout(compositionSyncTimer);
-        compositionSyncTimer = setTimeout(() => {
-            compositionSyncTimer = null;
+        if (editor.__stmnCompositionSyncTimer !== null && editor.__stmnCompositionSyncTimer !== undefined) {
+            clearTimeout(editor.__stmnCompositionSyncTimer);
+        }
+        editor.__stmnCompositionSyncTimer = setTimeout(() => {
+            editor.__stmnCompositionSyncTimer = null;
             stmnSettlingEditors.delete(editor);
             if (!stmnComposingEditors.has(editor)) syncEditorInput({ target });
         }, STMN_IME_SETTLE_MS);
     };
     editor.addEventListener('compositionstart', () => {
-        if (compositionSyncTimer !== null) clearTimeout(compositionSyncTimer);
-        compositionSyncTimer = null;
+        if (editor.__stmnCompositionSyncTimer !== null && editor.__stmnCompositionSyncTimer !== undefined) {
+            clearTimeout(editor.__stmnCompositionSyncTimer);
+        }
+        editor.__stmnCompositionSyncTimer = null;
         stmnSettlingEditors.delete(editor);
         stmnComposingEditors.add(editor);
     });
@@ -1640,7 +2626,7 @@ function stmnBindCard(card, note) {
     });
     editor.addEventListener('input', event => {
         if (event.isComposing || stmnComposingEditors.has(editor)) return;
-        if (compositionSyncTimer !== null) {
+        if (editor.__stmnCompositionSyncTimer !== null && editor.__stmnCompositionSyncTimer !== undefined) {
             scheduleCompositionSync(event);
             return;
         }
@@ -1650,8 +2636,10 @@ function stmnBindCard(card, note) {
         if (event.target.closest?.('.stmn-inline-image-caption')) return;
         if (event.isComposing || stmnComposingEditors.has(editor)) return;
         if (event.inputType !== 'insertParagraph' && event.inputType !== 'deleteContentBackward') return;
-        if (compositionSyncTimer !== null) clearTimeout(compositionSyncTimer);
-        compositionSyncTimer = null;
+        if (editor.__stmnCompositionSyncTimer !== null && editor.__stmnCompositionSyncTimer !== undefined) {
+            clearTimeout(editor.__stmnCompositionSyncTimer);
+        }
+        editor.__stmnCompositionSyncTimer = null;
         stmnSettlingEditors.delete(editor);
         stmnHandleChecklistBeforeInput(event, note, editor);
     });
@@ -1997,8 +2985,11 @@ async function stmnAddImage(note, file, insertionPoint = null) {
     }
     try {
         const dataUrl = await stmnCompressImage(file);
+        const runtime = stmnStorageRuntime;
+        if (!runtime || runtime.status !== 'ready' || runtime.readOnly) throw new Error('현재 메모는 이미지를 저장할 수 없는 상태입니다.');
+        const storedImage = await stmnStoreImageFile(runtime, dataUrl, file.name);
         const holder = document.createElement('div');
-        holder.innerHTML = stmnImageMarkup({ name: file.name, dataUrl, caption: '' });
+        holder.innerHTML = stmnImageMarkup({ name: file.name, id: storedImage.id, src: stmnFileUrl(storedImage.fileName), caption: '' });
         const image = holder.firstElementChild;
         const target = stmnEditorFor(note.id);
         if (target) {
@@ -2113,15 +3104,19 @@ function stmnCloseLightbox() {
     if (caption) caption.textContent = '';
 }
 
-function stmnRenderNotes() {
+function stmnRenderNotes({ flush = true } = {}) {
     const list = document.querySelector('#stmn-notes');
     const empty = document.querySelector('#stmn-empty');
     const count = document.querySelector('#stmn-result-count');
     const chatLabel = document.querySelector('#stmn-chat-label');
     if (!list || !empty || !count || !chatLabel) return;
 
+    if (flush) stmnFlushVisibleEditors(stmnStorageRuntime, { schedule: true });
     chatLabel.textContent = stmnChatLabel();
     list.replaceChildren();
+    if (stmnStorageRuntime?.status === 'ready') list.dataset.stmnOwnerId = stmnStorageRuntime.ownerId;
+    else delete list.dataset.stmnOwnerId;
+    empty.classList.remove('is-status');
     if (!stmnHasChat()) {
         stmnClearFindVisuals(true);
         stmnFindMatches = [];
@@ -2133,6 +3128,23 @@ function stmnRenderNotes() {
     }
 
     const store = stmnStore();
+    const runtime = stmnStorageRuntime;
+    const addButton = document.querySelector('#stmn-add-note');
+    if (addButton) addButton.disabled = !store || Boolean(runtime?.readOnly);
+    if (!store) {
+        stmnClearFindVisuals(true);
+        stmnFindMatches = [];
+        stmnFindIndex = -1;
+        empty.hidden = false;
+        count.textContent = '';
+        if (runtime?.status === 'error') {
+            empty.innerHTML = `<strong>공유 메모를 불러오지 못했습니다.</strong><span>${stmnEscapeHtml(runtime.error?.message || '기존 파일은 변경하지 않았습니다.')}</span><button id="stmn-storage-retry" type="button">다시 불러오기</button>`;
+            empty.querySelector('#stmn-storage-retry')?.addEventListener('click', () => stmnLoadCurrentStorage());
+        } else {
+            empty.innerHTML = '<strong>공유 메모를 불러오는 중입니다.</strong><span>확인과 무결성 검사가 끝날 때까지 잠시 기다려주세요.</span>';
+        }
+        return;
+    }
     const query = stmnSearch.trim().toLocaleLowerCase();
     const notes = query ? store.notes.filter(note => stmnSearchableText(note).includes(query)) : store.notes;
     count.textContent = query ? '0/0' : `${store.notes.length}`;
@@ -2141,6 +3153,11 @@ function stmnRenderNotes() {
         empty.innerHTML = '<strong>아직 메모가 없습니다.</strong><span>＋ 새 메모를 눌러 첫 포스트잇을 만들어보세요.</span>';
     } else if (notes.length === 0) {
         empty.innerHTML = '<strong>검색 결과가 없습니다.</strong><span>다른 검색어를 입력해보세요.</span>';
+    } else if (runtime?.readOnly) {
+        empty.classList.add('is-status');
+        empty.hidden = false;
+        empty.innerHTML = '<strong>다른 기기 또는 탭에서 편집 중입니다.</strong><span>현재 창은 데이터 충돌을 막기 위해 읽기 전용입니다.</span><button id="stmn-take-lease" type="button">이 창에서 편집권 가져오기</button>';
+        empty.querySelector('#stmn-take-lease')?.addEventListener('click', stmnTakeEditingLease);
     }
     notes.forEach(note => {
         const originalIndex = store.notes.findIndex(item => item.id === note.id);
@@ -2182,7 +3199,7 @@ function stmnPanelMarkup() {
         </div>
         <div class="stmn-search-wrap">
             <span aria-hidden="true">⌕</span>
-            <input id="stmn-search" type="search" placeholder="현재 채팅의 메모 검색" autocomplete="off">
+            <input id="stmn-search" type="search" placeholder="현재 캐릭터·그룹 메모 검색" autocomplete="off">
             <small id="stmn-result-count" aria-live="polite"></small>
             <button id="stmn-find-prev" type="button" title="이전 검색 결과" aria-label="이전 검색 결과" hidden>↑</button>
             <button id="stmn-find-next" type="button" title="다음 검색 결과" aria-label="다음 검색 결과" hidden>↓</button>
@@ -2322,6 +3339,7 @@ function stmnOpenPanel() {
     document.body.classList.add('stmn-panel-open');
     document.querySelector('#stmn-floating-button')?.setAttribute('aria-expanded', 'true');
     stmnApplyLayout();
+    if (stmnKeyboardLikelyOpen()) stmnApplyKeyboardViewport(panel);
     stmnPresentPanel(panel);
     stmnForcePanelVisible(panel, true);
     stmnRenderNotes();
@@ -2330,15 +3348,19 @@ function stmnOpenPanel() {
 function stmnClosePanel() {
     const panel = document.querySelector('#stmn-panel');
     if (!panel) return;
+    const runtime = stmnStorageRuntime;
+    stmnFlushVisibleEditors(runtime, { schedule: false });
     stmnPanelOpen = false;
     panel.classList.remove('stmn-open');
     panel.setAttribute('aria-hidden', 'true');
     if (panel.open) panel.close();
     delete panel.dataset.dialogMode;
     stmnForcePanelVisible(panel, false);
+    stmnClearKeyboardViewport(panel);
     document.body.classList.remove('stmn-panel-open');
     stmnApplyTabletLandscapeSplit(panel);
     document.querySelector('#stmn-floating-button')?.setAttribute('aria-expanded', 'false');
+    if (runtime?.dirty && !runtime.readOnly) void stmnSaveNow(runtime);
 }
 
 function stmnOpenFromLauncher(event = null) {
@@ -2354,6 +3376,8 @@ function stmnApplyLayout() {
     const settings = stmnSettings();
     const mode = stmnMode();
     const { width, height } = stmnViewport();
+    document.body?.style.setProperty('--stmn-layout-width', `${width}px`);
+    document.body?.style.setProperty('--stmn-layout-height', `${height}px`);
     panel.dataset.mode = mode;
     panel.classList.toggle('stmn-side-panel', stmnIsSideMode(mode));
     panel.classList.toggle('stmn-bottom-sheet', !stmnIsSideMode(mode));
@@ -2368,7 +3392,7 @@ function stmnApplyLayout() {
         panel.style.setProperty('bottom', '0', 'important');
         panel.style.setProperty('left', '0', 'important');
         panel.style.setProperty('width', `${renderedPanelWidth}px`, 'important');
-        panel.style.setProperty('height', '100dvh', 'important');
+        panel.style.setProperty('height', `${height}px`, 'important');
     } else {
         const heightKey = stmnMobileHeightKey(mode);
         const topKey = stmnMobileTopKey(mode);
@@ -2403,6 +3427,7 @@ function stmnApplyLayout() {
         stmnForcePanelVisible(panel, true);
     }
     stmnApplyTabletLandscapeSplit(panel, mode, renderedPanelWidth);
+    if (stmnKeyboardOpen) stmnApplyKeyboardViewport(panel);
     document.querySelectorAll('.stmn-card').forEach(stmnUpdateOverflow);
 }
 
@@ -2584,6 +3609,230 @@ function stmnBindFloatingDrag(button) {
     });
 }
 
+function stmnTimestamp(date = new Date()) {
+    const pad = value => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}_${String(date.getMilliseconds()).padStart(3, '0')}`;
+}
+
+function stmnSafeFileLabel(value) {
+    const label = String(value || 'memo').normalize('NFKC').replace(/[\\/:*?"<>|\x00-\x1f]/g, '-').replace(/\s+/g, '-').slice(0, 80);
+    return label || 'memo';
+}
+
+async function stmnSealBackup(payload) {
+    const sealed = structuredClone(payload);
+    delete sealed.checksum;
+    sealed.checksum = await stmnSha256(JSON.stringify(sealed));
+    return sealed;
+}
+
+async function stmnValidateBackup(payload) {
+    if (!payload || payload.app !== 'ChatSSi MeMo' || payload.schema !== STMN_BACKUP_SCHEMA || !['backup', 'conflict-copy'].includes(payload.type)) {
+        throw new Error('챗시 노트 백업 형식이 아닙니다.');
+    }
+    const clone = structuredClone(payload);
+    const checksum = clone.checksum;
+    delete clone.checksum;
+    if (!checksum || await stmnSha256(JSON.stringify(clone)) !== checksum) {
+        throw new Error('백업 파일의 무결성 검증에 실패했습니다.');
+    }
+    if (payload.type === 'backup' && (!Array.isArray(payload.owners) || payload.owners.some(owner => !owner?.ownerId || !owner?.payload?.store || !Array.isArray(owner.payload.store.notes) || !owner.images || typeof owner.images !== 'object'))) {
+        throw new Error('백업 파일의 소유자 데이터 구조가 손상되었습니다.');
+    }
+    return payload;
+}
+
+async function stmnBackupOwnerRecord(ownerId, index) {
+    const fileName = stmnOwnerFileName(ownerId);
+    const payload = await stmnReadJsonFile(fileName);
+    if (!payload) throw new Error(`${index.owners?.[ownerId]?.label || ownerId} 메모 파일이 없습니다.`);
+    await stmnValidatePayload(payload, 'owner', ownerId);
+    const images = {};
+    for (const [imageId, image] of Object.entries(payload.images || {})) {
+        const bytes = await stmnReadFileBytes(image.fileName);
+        if (!bytes || await stmnSha256(bytes) !== image.sha256) {
+            throw new Error(`${image.name || image.fileName} 이미지 검증에 실패했습니다.`);
+        }
+        images[imageId] = { ...image, dataBase64: stmnBytesToBase64(bytes) };
+    }
+    for (const note of payload.store.notes) {
+        const holder = document.createElement('div');
+        holder.innerHTML = stmnSanitizeEditorHtml(note.contentHtml);
+        for (const wrapper of holder.querySelectorAll('[data-stmn-image]')) {
+            const imageId = wrapper.dataset.stmnImageId;
+            if (!imageId || !images[imageId]) throw new Error('메모 본문이 참조하는 이미지가 저장소에 없습니다.');
+            if ((wrapper.querySelector('img')?.getAttribute('src') || '').startsWith('data:image/')) {
+                throw new Error('분리되지 않은 인라인 이미지가 남아 있어 백업을 중단했습니다.');
+            }
+        }
+    }
+    const ownerPayload = structuredClone(payload);
+    ownerPayload.lease = null;
+    const portablePayload = await stmnSealPayload(ownerPayload);
+    return {
+        ownerId,
+        ownerInfo: structuredClone(index.owners?.[ownerId] || payload.scope || {}),
+        payload: portablePayload,
+        images,
+    };
+}
+
+async function stmnBuildBackup(allOwners = false) {
+    stmnFlushVisibleEditors(stmnStorageRuntime, { schedule: false });
+    if (stmnStorageRuntime?.status === 'ready' && stmnStorageRuntime.dirty) {
+        await stmnSaveNow(stmnStorageRuntime);
+        if (stmnStorageRuntime.dirty) throw new Error('아직 저장되지 않은 변경이 있어 백업을 중단했습니다. 먼저 저장 상태를 확인해주세요.');
+    }
+    const index = await stmnReadIndex();
+    const ownerIds = allOwners
+        ? Object.keys(index.owners || {})
+        : stmnStorageRuntime?.ownerId ? [stmnStorageRuntime.ownerId] : [];
+    if (!ownerIds.length) throw new Error('백업할 메모가 없습니다.');
+    const owners = [];
+    for (const ownerId of ownerIds) owners.push(await stmnBackupOwnerRecord(ownerId, index));
+    const aliasSubset = {};
+    for (const [alias, ownerId] of Object.entries(index.aliases || {})) {
+        if (ownerIds.includes(ownerId)) aliasSubset[alias] = ownerId;
+    }
+    return stmnSealBackup({
+        app: 'ChatSSi MeMo',
+        schema: STMN_BACKUP_SCHEMA,
+        type: 'backup',
+        appVersion: '2.0.1',
+        createdAt: new Date().toISOString(),
+        scope: allOwners ? 'all' : 'current',
+        index: {
+            revision: index.revision,
+            aliases: aliasSubset,
+            owners: Object.fromEntries(ownerIds.map(ownerId => [ownerId, structuredClone(index.owners[ownerId] || {})])),
+        },
+        owners,
+    });
+}
+
+async function stmnRunBackup({ allOwners = false, internal = false } = {}) {
+    if (stmnBackupBusy) return;
+    stmnBackupBusy = true;
+    try {
+        const backup = await stmnBuildBackup(allOwners);
+        const text = JSON.stringify(backup, null, 2);
+        await stmnValidateBackup(JSON.parse(text));
+        const label = allOwners ? 'ALL' : stmnSafeFileLabel(stmnStorageRuntime?.scope?.label);
+        const fileName = `ChatSSi-MeMo_${label}_${stmnTimestamp()}.backup.json`;
+        if (internal) {
+            const internalName = `chatssi_memo_backup_${allOwners ? 'all' : 'current'}_${stmnTimestamp()}.json`;
+            await stmnUploadBase64(internalName, stmnUtf8ToBase64(text));
+            const verified = await stmnReadJsonFile(internalName);
+            await stmnValidateBackup(verified);
+            globalThis.toastr?.success?.('실리태번 사용자 파일 폴더에 수동 스냅샷을 저장했습니다.');
+        } else {
+            stmnDownloadBlob(fileName, new Blob([text], { type: 'application/json' }));
+            globalThis.toastr?.success?.('검증된 수동 백업을 만들었습니다.');
+        }
+    } catch (error) {
+        console.error('[ChatSSi MeMo] Backup failed', error);
+        globalThis.toastr?.error?.(error.message || '백업을 만들지 못했습니다.');
+    } finally {
+        stmnBackupBusy = false;
+    }
+}
+
+function stmnRewriteRestoredImageRefs(store, imageMap) {
+    const restored = stmnNormalizeStoreObject(structuredClone(store));
+    for (const note of restored.notes) {
+        const holder = document.createElement('div');
+        holder.innerHTML = stmnSanitizeEditorHtml(note.contentHtml);
+        for (const wrapper of holder.querySelectorAll('[data-stmn-image]')) {
+            const mapped = imageMap.get(wrapper.dataset.stmnImageId);
+            if (!mapped) throw new Error('백업 본문이 참조하는 이미지 데이터가 없습니다.');
+            wrapper.dataset.stmnImageId = mapped.id;
+            wrapper.querySelector('img')?.setAttribute('src', stmnFileUrl(mapped.fileName));
+        }
+        note.contentHtml = stmnNormalizeEditorHtml(holder.innerHTML);
+    }
+    return restored;
+}
+
+async function stmnRestoreOwnerRecord(record, targetRuntime, mode) {
+    const imageMap = new Map();
+    for (const [oldId, image] of Object.entries(record.images || {})) {
+        const bytes = stmnBase64ToBytes(image.dataBase64);
+        if (await stmnSha256(bytes) !== image.sha256) throw new Error(`${image.name || oldId} 이미지 체크섬이 일치하지 않습니다.`);
+        const id = targetRuntime.ownerId === record.ownerId ? oldId : (crypto.randomUUID?.() || stmnId('image').replace(/^image-/, ''));
+        const fileName = `${STMN_IMAGE_FILE_PREFIX}${targetRuntime.ownerId}_${id}.${stmnImageExtension(image.mimeType)}`;
+        await stmnUploadBase64(fileName, stmnBytesToBase64(bytes));
+        const verifiedBytes = await stmnReadFileBytes(fileName);
+        if (!verifiedBytes || await stmnSha256(verifiedBytes) !== image.sha256) throw new Error('복원 이미지 검증에 실패했습니다.');
+        const restoredImage = { ...image, id, fileName };
+        delete restoredImage.dataBase64;
+        targetRuntime.payload.images[id] = restoredImage;
+        imageMap.set(oldId, restoredImage);
+    }
+    const restoredStore = stmnRewriteRestoredImageRefs(record.payload.store, imageMap);
+    const nextStore = mode === 'replace'
+        ? restoredStore
+        : stmnMergeStores(targetRuntime.payload.store, restoredStore, 'backup-restore').store;
+    await stmnWriteOwner(targetRuntime, nextStore);
+}
+
+async function stmnImportBackup(file, mode = 'merge') {
+    if (stmnBackupBusy) return;
+    stmnBackupBusy = true;
+    try {
+        const backup = await stmnValidateBackup(JSON.parse(await file.text()));
+        if (backup.type !== 'backup' || !Array.isArray(backup.owners) || !backup.owners.length) throw new Error('복원할 메모가 없는 백업입니다.');
+        const noteCount = backup.owners.reduce((sum, owner) => sum + (owner.payload?.store?.notes?.length || 0), 0);
+        const imageCount = backup.owners.reduce((sum, owner) => sum + Object.keys(owner.images || {}).length, 0);
+        const summary = `${backup.createdAt || '날짜 미상'} 백업\n소유자 ${backup.owners.length}개 · 메모 ${noteCount}개 · 이미지 ${imageCount}개`;
+        if (!globalThis.confirm(`${summary}\n\n${mode === 'replace' ? '현재 메모를 교체' : '현재 메모와 안전하게 병합'}할까요?`)) return;
+        if (mode === 'replace' && !globalThis.confirm('교체 모드는 현재 메모 구성을 백업 내용으로 바꿉니다. 계속할까요?')) return;
+
+        const safety = await stmnBuildBackup(backup.scope === 'all');
+        const safetyName = `chatssi_memo_backup_pre_restore_${stmnTimestamp()}.json`;
+        await stmnUploadBase64(safetyName, stmnUtf8ToBase64(JSON.stringify(safety, null, 2)));
+        await stmnValidateBackup(await stmnReadJsonFile(safetyName));
+
+        if (backup.scope === 'current' || backup.owners.length === 1) {
+            if (!stmnStorageRuntime || stmnStorageRuntime.status !== 'ready') throw new Error('복원 대상 캐릭터나 그룹 채팅을 먼저 열어주세요.');
+            await stmnRestoreOwnerRecord(backup.owners[0], stmnStorageRuntime, mode);
+        } else {
+            let index = await stmnReadIndex();
+            for (const record of backup.owners) {
+                let payload = await stmnReadJsonFile(stmnOwnerFileName(record.ownerId));
+                if (!payload) {
+                    payload = await stmnVerifiedWriteJson(
+                        stmnOwnerFileName(record.ownerId),
+                        stmnOwnerPreviousFileName(record.ownerId),
+                        stmnEmptyOwner(record.ownerId, record.payload.scope || { kind: 'character', label: record.ownerInfo?.label || '복원 메모' }),
+                        value => stmnValidatePayload(value, 'owner', record.ownerId),
+                    );
+                } else await stmnValidatePayload(payload, 'owner', record.ownerId);
+                const runtime = {
+                    status: 'ready',
+                    scope: record.payload.scope || record.ownerInfo || {},
+                    ownerId: record.ownerId,
+                    fileName: stmnOwnerFileName(record.ownerId),
+                    payload,
+                    readOnly: stmnLeaseIsForeign(payload),
+                };
+                await stmnRestoreOwnerRecord(record, runtime, mode);
+                index.owners[record.ownerId] ??= structuredClone(record.ownerInfo || { ownerId: record.ownerId, kind: runtime.scope.kind, label: runtime.scope.label, aliases: [] });
+            }
+            for (const [alias, ownerId] of Object.entries(backup.index?.aliases || {})) {
+                if (!index.aliases[alias]) index.aliases[alias] = ownerId;
+            }
+            index = await stmnWriteIndex(index);
+        }
+        await stmnLoadCurrentStorage();
+        globalThis.toastr?.success?.('백업을 검증하고 복원했습니다. 복원 전 안전 스냅샷도 보존했습니다.');
+    } catch (error) {
+        console.error('[ChatSSi MeMo] Restore failed', error);
+        globalThis.toastr?.error?.(error.message || '백업을 복원하지 못했습니다.');
+    } finally {
+        stmnBackupBusy = false;
+    }
+}
+
 function stmnAddSettingsPanel() {
     const host = document.querySelector('#extensions_settings2');
     if (!host || document.querySelector('#stmn-settings')) return;
@@ -2597,7 +3846,7 @@ function stmnAddSettingsPanel() {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <p>현재 채팅에만 연결되며 AI 프롬프트에는 주입되지 않습니다.</p>
+                <p>같은 캐릭터의 채팅과 브랜치가 하나의 메모를 공유합니다. 메모는 AI 프롬프트에 주입되지 않습니다.</p>
                 <label class="checkbox_label"><input id="stmn-setting-floating" type="checkbox"><span>플로팅 메모 버튼 표시</span></label>
                 <label class="stmn-setting-row">
                     <span>앱 테마</span>
@@ -2636,6 +3885,25 @@ function stmnAddSettingsPanel() {
                     <label><span>웹폰트 주소</span><input id="stmn-new-font-url" type="url" maxlength="2048" placeholder="https://example.com/font.woff2"></label>
                     <button id="stmn-add-user-font" class="menu_button" type="button">사용자 폰트 추가</button>
                     <div id="stmn-user-font-list"></div>
+                </div>
+                <div class="stmn-backup-manager">
+                    <strong>메모 데이터 백업·복원</strong>
+                    <p>다운로드 백업은 기기 밖에도 보관할 수 있습니다. 내부 스냅샷은 실리태번의 <code>user/files</code>에 날짜별로 저장됩니다.</p>
+                    <div class="stmn-backup-grid">
+                        <button id="stmn-backup-current" class="menu_button" type="button">현재 캐릭터 백업</button>
+                        <button id="stmn-backup-all" class="menu_button" type="button">전체 메모 백업</button>
+                        <button id="stmn-snapshot-current" class="menu_button" type="button">현재 내부 스냅샷</button>
+                        <button id="stmn-snapshot-all" class="menu_button" type="button">전체 내부 스냅샷</button>
+                    </div>
+                    <label class="stmn-setting-row">
+                        <span>복원 방식</span>
+                        <select id="stmn-restore-mode">
+                            <option value="merge">안전 병합(권장)</option>
+                            <option value="replace">현재 내용 교체</option>
+                        </select>
+                    </label>
+                    <button id="stmn-restore-button" class="menu_button" type="button">백업 파일 가져오기</button>
+                    <input id="stmn-restore-input" type="file" accept="application/json,.json" hidden>
                 </div>
                 <div class="stmn-settings-buttons">
                     <button id="stmn-setting-open" class="menu_button" type="button">메모장 열기</button>
@@ -2678,6 +3946,17 @@ function stmnAddSettingsPanel() {
     });
     wrapper.querySelector('#stmn-add-user-font').addEventListener('click', stmnAddUserFont);
     stmnRenderCustomFontManager();
+    wrapper.querySelector('#stmn-backup-current').addEventListener('click', () => stmnRunBackup({ allOwners: false, internal: false }));
+    wrapper.querySelector('#stmn-backup-all').addEventListener('click', () => stmnRunBackup({ allOwners: true, internal: false }));
+    wrapper.querySelector('#stmn-snapshot-current').addEventListener('click', () => stmnRunBackup({ allOwners: false, internal: true }));
+    wrapper.querySelector('#stmn-snapshot-all').addEventListener('click', () => stmnRunBackup({ allOwners: true, internal: true }));
+    const restoreInput = wrapper.querySelector('#stmn-restore-input');
+    wrapper.querySelector('#stmn-restore-button').addEventListener('click', () => restoreInput.click());
+    restoreInput.addEventListener('change', async () => {
+        const file = restoreInput.files?.[0];
+        restoreInput.value = '';
+        if (file) await stmnImportBackup(file, wrapper.querySelector('#stmn-restore-mode').value);
+    });
     wrapper.querySelector('#stmn-setting-open').addEventListener('click', stmnOpenPanel);
     wrapper.querySelector('#stmn-setting-new').addEventListener('click', () => {
         stmnOpenPanel();
@@ -2754,7 +4033,7 @@ function stmnRegisterSlashCommand() {
                 callback: stmnSlashCallback,
                 returns: '빈 문자열(채팅으로 전송하지 않음)',
                 helpString: `
-                    <div>AI에게 보내지 않는 현재 채팅 전용 메모장을 조작합니다.</div>
+                    <div>AI에게 보내지 않는 현재 캐릭터·그룹 공유 메모장을 조작합니다.</div>
                     <ul>
                         <li><code>/memo</code> — 메모장 열기</li>
                         <li><code>/memo 새 제목</code> — 새 메모</li>
@@ -2777,27 +4056,49 @@ function stmnRegisterSlashCommand() {
 function stmnBindAppEvents() {
     const context = stmnContext();
     if (!context?.eventSource || !context?.event_types) return;
-    context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
-        if (stmnSaveTimer) clearTimeout(stmnSaveTimer);
-        if (stmnFindRefreshTimer) clearTimeout(stmnFindRefreshTimer);
-        stmnSaveTimer = null;
-        stmnFindRefreshTimer = null;
-        stmnClearFindVisuals(true);
-        stmnSearch = '';
-        stmnFindMatches = [];
-        stmnFindIndex = -1;
-        const search = document.querySelector('#stmn-search');
-        if (search) search.value = '';
-        stmnEditorRanges.clear();
-        stmnSelectedRanges.clear();
-        stmnPendingImageRanges.clear();
-        stmnSelectedImages.clear();
-        stmnRenderNotes();
-    });
+    context.eventSource.on(context.event_types.CHAT_CHANGED, () => { void stmnLoadCurrentStorage(); });
+    if (context.event_types.CHARACTER_RENAMED) {
+        context.eventSource.on(context.event_types.CHARACTER_RENAMED, (...args) => { void stmnHandleCharacterRenamed(...args); });
+    }
 }
 
-function stmnOnViewportChange() {
-    stmnApplyLayout();
+function stmnScheduleStableLayout() {
+    if (stmnViewportTimer) clearTimeout(stmnViewportTimer);
+    stmnViewportTimer = setTimeout(() => {
+        stmnViewportTimer = null;
+        if (stmnKeyboardLikelyOpen() || (stmnKeyboardOpen && stmnVisibleViewportReduced())) {
+            stmnApplyKeyboardViewport();
+            return;
+        }
+        stmnClearKeyboardViewport();
+        stmnCommitStableViewport();
+        stmnApplyLayout();
+    }, STMN_VIEWPORT_SETTLE_MS);
+}
+
+function stmnOnWindowResize() {
+    if (stmnKeyboardLikelyOpen() || (stmnKeyboardOpen && stmnVisibleViewportReduced())) {
+        if (stmnViewportTimer) clearTimeout(stmnViewportTimer);
+        stmnViewportTimer = null;
+        stmnApplyKeyboardViewport();
+        return;
+    }
+    stmnScheduleStableLayout();
+}
+
+function stmnOnVisualViewportChange() {
+    if (stmnKeyboardLikelyOpen() || (stmnKeyboardOpen && stmnVisibleViewportReduced())) {
+        if (stmnViewportTimer) clearTimeout(stmnViewportTimer);
+        stmnViewportTimer = null;
+        stmnApplyKeyboardViewport();
+        return;
+    }
+    stmnScheduleStableLayout();
+}
+
+function stmnOnOrientationChange() {
+    stmnClearKeyboardViewport();
+    stmnScheduleStableLayout();
 }
 
 async function stmnInit() {
@@ -2813,22 +4114,27 @@ async function stmnInit() {
         console.warn('[ChatSSi MeMo] A stale or duplicate UI instance was replaced.');
     }
     document.body.classList.remove('stmn-tablet-landscape-split');
+    document.body.classList.remove('stmn-keyboard-open');
     document.body.style.removeProperty('--stmn-tablet-panel-width');
+    stmnCommitStableViewport();
     stmnInitialized = true;
     stmnSettings();
     stmnPanelMarkup();
+    void stmnLoadCurrentStorage();
     stmnAddSettingsPanel();
     stmnAddWandButton();
     stmnRegisterSlashCommand();
     stmnBindAppEvents();
-    globalThis.addEventListener('resize', stmnOnViewportChange);
-    globalThis.visualViewport?.addEventListener('resize', stmnOnViewportChange);
+    globalThis.addEventListener('resize', stmnOnWindowResize);
+    globalThis.visualViewport?.addEventListener('resize', stmnOnVisualViewportChange);
+    globalThis.addEventListener('orientationchange', stmnOnOrientationChange);
     globalThis.addEventListener('beforeunload', () => {
-        if (stmnSaveTimer) stmnSaveNow();
+        stmnFlushVisibleEditors(stmnStorageRuntime, { schedule: false });
+        if (stmnStorageRuntime?.dirty) void stmnSaveNow(stmnStorageRuntime);
     });
     setTimeout(stmnAddWandButton, 1200);
     setTimeout(stmnAddSettingsPanel, 1200);
-    console.info('[ChatSSi MeMo] v1.3.5 loaded');
+    console.info('[ChatSSi MeMo] v2.0.1 loaded');
 }
 
 if (document.readyState === 'loading') {

@@ -83,7 +83,7 @@
     right: auto;
     bottom: 0;
     left: 0;
-    height: 100dvh;
+    height: var(--stmn-layout-height, 100dvh);
     max-width: 62vw;
     border-radius: 0 var(--stmn-radius) var(--stmn-radius) 0;
     transform: none;
@@ -152,10 +152,16 @@
 body.stmn-tablet-landscape-split #sheld {
     left: var(--stmn-tablet-panel-width) !important;
     right: 0 !important;
-    width: min(var(--sheldWidth, 50vw), calc(100dvw - var(--stmn-tablet-panel-width))) !important;
-    max-width: calc(100dvw - var(--stmn-tablet-panel-width)) !important;
+    width: min(var(--sheldWidth, 50vw), calc(var(--stmn-layout-width, 100vw) - var(--stmn-tablet-panel-width))) !important;
+    max-width: calc(var(--stmn-layout-width, 100vw) - var(--stmn-tablet-panel-width)) !important;
     margin-right: auto !important;
     margin-left: auto !important;
+}
+
+body.stmn-keyboard-open.stmn-tablet-landscape-split #sheld {
+    left: var(--stmn-tablet-panel-width) !important;
+    width: min(var(--sheldWidth, 50vw), calc(var(--stmn-layout-width) - var(--stmn-tablet-panel-width))) !important;
+    max-width: calc(var(--stmn-layout-width) - var(--stmn-tablet-panel-width)) !important;
 }
 
 .stmn-side-panel > .stmn-panel-corner-resizer,
@@ -453,6 +459,24 @@ body.stmn-tablet-landscape-split #sheld {
     font-size: 12px;
 }
 
+.stmn-empty.is-status {
+    flex: 0 0 auto;
+    margin: 0 12px 8px;
+    padding: 9px 12px;
+    border: 1px solid color-mix(in srgb, var(--stmn-accent) 45%, transparent);
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--stmn-button-bg) 86%, var(--stmn-panel-bg));
+}
+
+.stmn-empty button {
+    min-height: 28px;
+    padding: 3px 10px;
+    border: 1px solid var(--stmn-panel-border);
+    border-radius: 6px;
+    color: var(--stmn-panel-text);
+    background: var(--stmn-button-bg);
+}
+
 .stmn-card {
     position: relative;
     font-family: var(--stmn-note-font);
@@ -466,6 +490,18 @@ body.stmn-tablet-landscape-split #sheld {
     background: var(--stmn-card-bg);
     box-shadow: 0 5px 14px rgba(43, 37, 25, .14);
     overflow: hidden;
+}
+
+.stmn-card.is-read-only .stmn-title-input,
+.stmn-card.is-read-only .stmn-unified-editor {
+    cursor: default;
+}
+
+.stmn-card.is-read-only .stmn-inline-checkbox,
+.stmn-card.is-read-only .stmn-inline-image-remove,
+.stmn-card.is-read-only .stmn-inline-image-caption,
+.stmn-card.is-read-only .stmn-card-resizer {
+    pointer-events: none;
 }
 
 /* 선택 폰트는 챗시 노트의 메모 카드 안에서만 SillyTavern 테마의 전역 폰트 규칙보다 우선합니다. */
@@ -1100,7 +1136,8 @@ html body #stmn-panel#stmn-panel.stmn-font-override .stmn-card * {
 .stmn-font-manager > label > span,
 .stmn-theme-color-grid label > span,
 .stmn-custom-theme-editor > strong,
-.stmn-font-manager > strong {
+.stmn-font-manager > strong,
+.stmn-backup-manager > strong {
     writing-mode: horizontal-tb !important;
     word-break: keep-all;
     overflow-wrap: normal;
@@ -1157,6 +1194,33 @@ html body #stmn-panel#stmn-panel.stmn-font-override .stmn-card * {
     padding: 10px;
     border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.35));
     border-radius: 8px;
+}
+
+.stmn-backup-manager {
+    margin-top: 12px;
+    padding: 10px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.35));
+    border-radius: 8px;
+}
+
+.stmn-backup-manager > strong {
+    display: block;
+    margin-bottom: 7px;
+}
+
+.stmn-backup-manager > p {
+    margin-bottom: 8px !important;
+}
+
+.stmn-backup-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px;
+}
+
+.stmn-backup-grid button,
+#stmn-restore-button {
+    width: 100%;
 }
 
 .stmn-font-manager > strong {
@@ -1239,6 +1303,10 @@ html body #stmn-panel#stmn-panel.stmn-font-override .stmn-card * {
         align-items: stretch;
         flex-direction: column;
         gap: 5px;
+    }
+
+    .stmn-backup-grid {
+        grid-template-columns: minmax(0, 1fr);
     }
 
     .stmn-setting-row select,
